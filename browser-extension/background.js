@@ -329,7 +329,10 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-function shouldCaptureDownload(item) {
+const IGNORE_EXT_RE = /\.(html?|mhtml|xhtml|css|js|json|xml)(\?|$)/i;
+
+function shouldCaptureDownload(item, fromDeterminingFilename = false) {
+  if (!item || item.byExtensionId) return false;
   const url = item.finalUrl || item.url || "";
   if (!isHttpUrl(url)) {
     return false;
@@ -337,21 +340,33 @@ function shouldCaptureDownload(item) {
   if (url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")) {
     return false;
   }
-  if (CAPTURE_EXT_RE.test(url) || (item.filename && CAPTURE_EXT_RE.test(item.filename))) {
+  const fname = basename(item.filename) || "";
+  if (fname && IGNORE_EXT_RE.test(fname)) {
+    return false;
+  }
+  if (CAPTURE_EXT_RE.test(url) || (fname && CAPTURE_EXT_RE.test(fname))) {
     return true;
   }
   const mime = (item.mime || "").toLowerCase();
   if (
     mime.startsWith("application/octet-stream") ||
     mime.startsWith("application/x-") ||
+    mime.startsWith("application/vnd.") ||
     mime.startsWith("application/zip") ||
+    mime.startsWith("application/gzip") ||
     mime.startsWith("application/pdf") ||
+    mime.startsWith("binary/") ||
     mime.startsWith("video/") ||
     mime.startsWith("audio/")
   ) {
     return true;
   }
-  if (typeof item.fileSize === "number" && item.fileSize >= MIN_INTERCEPT_SIZE) {
+  if (typeof item.fileSize === "number" && item.fileSize >= 64 * 1024) {
+    return true;
+  }
+  // When Chrome already decided to save a file with a real filename (and not an HTML webpage),
+  // capture it even if Content-Length is unknown (-1)
+  if (fromDeterminingFilename && fname) {
     return true;
   }
   return false;
@@ -405,23 +420,38 @@ async function sendToSiphon({ url, filename, referrer, mime, fileSize, silent = 
 // Listen in onDeterminingFilename so we get the server's resolved Content-Disposition filename & size
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   suggest();
-  handleDownloadItem(item);
+  handleDownloadItem(item, true);
 });
 
 chrome.downloads.onCreated.addListener((item) => {
-  // Fallback for browsers that do not fire onDeterminingFilename
-  setTimeout(() => handleDownloadItem(item), 120);
+  // Fallback for browsers that do not fire onDeterminingFilename: re-query latest item metadata
+  setTimeout(async () => {
+    if (!item || handledIds.has(item.id)) return;
+    try {
+      const results = await chrome.downloads.search({ id: item.id });
+      if (results && results[0]) {
+        await handleDownloadItem(results[0], false);
+      }
+    } catch (_) {
+      await handleDownloadItem(item, false);
+    }
+  }, 350);
 });
 
-async function handleDownloadItem(item) {
+async function handleDownloadItem(item, fromDeterminingFilename = false) {
   if (!item || handledIds.has(item.id)) return;
   if (item.state && item.state !== "in_progress") return;
 
   const st = await chrome.storage.local.get({ enabled: true });
   if (!st.enabled) return;
 
-  if (!shouldCaptureDownload(item)) return;
+  if (!shouldCaptureDownload(item, fromDeterminingFilename)) return;
   handledIds.add(item.id);
+
+  // Pause browser native transfer while handing off to Siphon so small files don't race to completion
+  try {
+    await chrome.downloads.pause(item.id);
+  } catch (_) {}
 
   const url = item.finalUrl || item.url;
   const captured = await sendToSiphon({
@@ -434,11 +464,15 @@ async function handleDownloadItem(item) {
   });
 
   if (captured) {
+    flashBadge("OK", "#22C55E");
     try {
       await chrome.downloads.cancel(item.id);
       await chrome.downloads.erase({ id: item.id });
     } catch (_) {}
   } else {
     handledIds.delete(item.id);
+    try {
+      await chrome.downloads.resume(item.id);
+    } catch (_) {}
   }
 }

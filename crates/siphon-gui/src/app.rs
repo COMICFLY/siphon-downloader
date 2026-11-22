@@ -541,6 +541,9 @@ impl SiphonApp {
         let existing_hwnd = self.capture_popup.as_ref().and_then(|p| p.window_hwnd);
 
         let (popup_win_id, win_task) = if let Some(pid) = existing_win {
+            if let Some(hwnd) = existing_hwnd {
+                show_window_native(hwnd);
+            }
             (Some(pid), window::gain_focus(pid))
         } else {
             let (rgba, w, h) = siphon_platform_win::generate_siphon_icon_rgba();
@@ -687,6 +690,7 @@ impl SiphonApp {
                     popup.window_hwnd = Some(hwnd);
                 }
                 self.apply_backdrop_now();
+                show_window_native(hwnd);
                 if let Some(shared) = SHARED.get() {
                     install_window_hooks(hwnd, shared.hook_tx.clone());
                 }

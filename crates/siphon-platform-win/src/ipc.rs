@@ -164,6 +164,86 @@ pub fn spawn_ipc_server(tx: mpsc::UnboundedSender<IpcCommand>) {
 #[cfg(not(windows))]
 pub fn spawn_ipc_server(_tx: mpsc::UnboundedSender<IpcCommand>) {}
 
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    const MAX_REQ_BYTES: usize = 512 * 1024;
+    let mut data = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+
+    let (hdr_len, sep_len) = loop {
+        if let Some(pos) = find_header_end(&data) {
+            break pos;
+        }
+        if data.len() >= MAX_REQ_BYTES {
+            return None;
+        }
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut tmp))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            if data.is_empty() {
+                return None;
+            }
+            break (data.len(), 0);
+        }
+        data.extend_from_slice(&tmp[..n]);
+    };
+
+    let headers_str = String::from_utf8_lossy(&data[..hdr_len]).into_owned();
+    let body_start = hdr_len + sep_len;
+
+    let mut content_length: usize = 0;
+    let mut expects_continue = false;
+    for line in headers_str.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("content-length") {
+                content_length = val.parse::<usize>().unwrap_or(0).min(MAX_REQ_BYTES);
+            } else if key.eq_ignore_ascii_case("expect")
+                && val.eq_ignore_ascii_case("100-continue")
+            {
+                expects_continue = true;
+            }
+        }
+    }
+
+    if expects_continue && data.len() < body_start + content_length {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+        let _ = stream.flush().await;
+    }
+
+    let target_total = body_start.saturating_add(content_length);
+    while data.len() < target_total && data.len() < MAX_REQ_BYTES {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut tmp))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&tmp[..n]);
+    }
+
+    let body_end = data.len().min(target_total);
+    let body = if body_start <= body_end {
+        data[body_start..body_end].to_vec()
+    } else {
+        Vec::new()
+    };
+    Some((headers_str, body))
+}
+
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((i, 4));
+    }
+    if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((i, 2));
+    }
+    None
+}
+
 /// Spawn a lightweight local loopback HTTP server (`127.0.0.1:16800`) so the Chrome/Edge
 /// browser extension can send intercepted downloads (with cookies, Referer, filename, size)
 /// with zero Windows registry configuration.
@@ -199,15 +279,10 @@ pub fn spawn_browser_http_bridge(
             let flag = Arc::clone(&enabled_flag);
 
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                let Ok(n) = stream.read(&mut buf).await else {
+                let Some((headers_str, body_bytes)) = read_http_request(&mut stream).await else {
                     return;
                 };
-                if n == 0 {
-                    return;
-                }
-                let raw = String::from_utf8_lossy(&buf[..n]);
-                let first_line = raw.lines().next().unwrap_or("");
+                let first_line = headers_str.lines().next().unwrap_or("");
                 let mut parts = first_line.split_whitespace();
                 let method = parts.next().unwrap_or("");
                 let path = parts.next().unwrap_or("");
@@ -249,13 +324,8 @@ pub fn spawn_browser_http_bridge(
                             r#"{"ok":false,"captured":false,"reason":"disabled"}"#.to_string(),
                         )
                     } else {
-                        let json_body = raw
-                            .split_once("\r\n\r\n")
-                            .map(|(_, b)| b)
-                            .or_else(|| raw.split_once("\n\n").map(|(_, b)| b))
-                            .unwrap_or("")
-                            .trim_matches(char::from(0))
-                            .trim();
+                        let json_str = String::from_utf8_lossy(&body_bytes);
+                        let json_body = json_str.trim_matches(char::from(0)).trim();
 
                         match serde_json::from_str::<BrowserCapturePayload>(json_body) {
                             Ok(payload)
@@ -341,6 +411,48 @@ mod tests {
                 assert_eq!(p.file_size, Some(4096));
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_http_bridge_accepts_split_tcp_post_like_chromium_fetch() {
+        let enabled = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let port = 26820u16;
+        spawn_browser_http_bridge(port, Arc::clone(&enabled), tx);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect to local browser bridge");
+        let body = r#"{"url":"https://release-assets.githubusercontent.com/app.exe","filename":"app.exe","file_size":4096000}"#;
+        let headers = format!(
+            "POST /api/capture HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        // Send headers first, pause, then send JSON body (exact Chromium fetch behavior!)
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        stream.write_all(body.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("200 OK"), "unexpected response: {resp_str}");
+        assert!(resp_str.contains(r#""captured":true"#));
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for BrowserCapture")
+            .expect("channel closed");
+        match cmd {
+            IpcCommand::BrowserCapture(p) => {
+                assert_eq!(p.url, "https://release-assets.githubusercontent.com/app.exe");
+                assert_eq!(p.filename.as_deref(), Some("app.exe"));
+            }
+            other => panic!("expected BrowserCapture, got {other:?}"),
         }
     }
 }
