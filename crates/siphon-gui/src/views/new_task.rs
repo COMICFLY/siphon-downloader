@@ -1,5 +1,5 @@
 use crate::icons::{IconKind, icon};
-use crate::state::{InputTarget, Message, NewTaskModalState};
+use crate::state::{InputTarget, Message, NewTaskModalState, P2pSelectTab};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette, input_style,
     modal_card_style, outline_btn_style, panel_style, primary_btn_style, subtle_btn_style,
@@ -338,32 +338,58 @@ pub fn view<'a>(modal: &'a NewTaskModalState, palette: SiphonPalette) -> Element
             .style(outline_btn_style(palette))
             .on_press(Message::ModalPickTorrentFile);
 
+        let url_trim_low = modal.url.trim().to_ascii_lowercase();
+        let is_bt_link = url_trim_low.starts_with("magnet:?")
+            || url_trim_low.ends_with(".torrent");
+        let is_ed2k_link = url_trim_low.starts_with("ed2k://|file|");
+
+        let mut url_actions = row![
+            wrap_input(
+                text_input(
+                    "https://... · .m3u8 · magnet:?xt=... · ed2k://|file|...",
+                    &modal.url
+                )
+                .id(modal_url_id())
+                .on_input(Message::ModalUrlChanged)
+                .on_submit(Message::ModalProbeUrl)
+                .font(FONT_REGULAR)
+                .size(14)
+                .padding([8, 12])
+                .width(Length::Fill)
+                .style(input_style(palette)),
+                InputTarget::ModalUrl
+            ),
+            probe_btn,
+            torrent_btn,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        if is_bt_link || is_ed2k_link {
+            let tab = if is_ed2k_link {
+                P2pSelectTab::Ed2k
+            } else {
+                P2pSelectTab::Torrent
+            };
+            url_actions = url_actions.push(
+                button(
+                    text("选择文件窗")
+                        .size(12)
+                        .font(FONT_MEDIUM)
+                        .wrapping(text::Wrapping::None),
+                )
+                .padding([8, 10])
+                .style(primary_btn_style(palette))
+                .on_press(Message::OpenP2pSelectPopup(tab, Some(modal.url.trim().to_string()))),
+            );
+        }
+
         let url_row = column![
             text("下载链接（支持 HTTP/HTTPS · HLS .m3u8 · Magnet 磁力 · 本地 .torrent · eD2k 电驴）")
                 .size(12)
                 .font(FONT_MEDIUM)
                 .color(palette.text_secondary),
-            row![
-                wrap_input(
-                    text_input(
-                        "https://... · .m3u8 · magnet:?xt=... · ed2k://|file|...",
-                        &modal.url
-                    )
-                    .id(modal_url_id())
-                    .on_input(Message::ModalUrlChanged)
-                    .on_submit(Message::ModalProbeUrl)
-                    .font(FONT_REGULAR)
-                    .size(14)
-                    .padding([8, 12])
-                    .width(Length::Fill)
-                    .style(input_style(palette)),
-                    InputTarget::ModalUrl
-                ),
-                probe_btn,
-                torrent_btn,
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+            url_actions,
         ]
         .spacing(6);
 

@@ -65,6 +65,7 @@ impl TaskStore {
                 category TEXT NOT NULL DEFAULT 'other',
                 matched_rule TEXT,
                 checksum_json TEXT,
+                selected_files_json TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
                 error_message TEXT,
                 created_at TEXT NOT NULL,
@@ -98,6 +99,8 @@ impl TaskStore {
             );
             "#,
         )?;
+        // Seamless idempotent migration for databases created before v0.7.0
+        let _ = conn.execute("ALTER TABLE tasks ADD COLUMN selected_files_json TEXT", []);
         Ok(())
     }
 
@@ -125,6 +128,11 @@ impl TaskStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let selected_files_json = task
+            .selected_files
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let source_str = serde_json::to_string(&task.source)?;
 
         tx.execute(
@@ -134,13 +142,13 @@ impl TaskStore {
                 total_size, downloaded_bytes, status, supports_range,
                 etag, last_modified, content_type, headers_json,
                 max_connections, speed_limit_bps, category, matched_rule,
-                checksum_json, source, error_message, created_at, completed_at
+                checksum_json, selected_files_json, source, error_message, created_at, completed_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14,
                 ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23
+                ?19, ?20, ?21, ?22, ?23, ?24
             )
             ON CONFLICT(id) DO UPDATE SET
                 protocol = excluded.protocol,
@@ -161,6 +169,7 @@ impl TaskStore {
                 category = excluded.category,
                 matched_rule = excluded.matched_rule,
                 checksum_json = excluded.checksum_json,
+                selected_files_json = excluded.selected_files_json,
                 source = excluded.source,
                 error_message = excluded.error_message,
                 completed_at = excluded.completed_at
@@ -185,6 +194,7 @@ impl TaskStore {
                 task.category.as_str(),
                 task.matched_rule,
                 checksum_json,
+                selected_files_json,
                 source_str,
                 task.error_message,
                 task.created_at.to_rfc3339(),
@@ -282,7 +292,7 @@ impl TaskStore {
                 total_size, downloaded_bytes, status, supports_range,
                 etag, last_modified, content_type, headers_json,
                 max_connections, speed_limit_bps, category, matched_rule,
-                checksum_json, source, error_message, created_at, completed_at
+                checksum_json, selected_files_json, source, error_message, created_at, completed_at
             FROM tasks
             ORDER BY created_at DESC
             "#,
@@ -308,15 +318,19 @@ impl TaskStore {
             let category_str: String = row.get(16)?;
             let matched_rule: Option<String> = row.get(17)?;
             let checksum_json: Option<String> = row.get(18)?;
-            let source_str: String = row.get(19)?;
-            let error_message: Option<String> = row.get(20)?;
-            let created_at_str: String = row.get(21)?;
-            let completed_at_str: Option<String> = row.get(22)?;
+            let selected_files_json: Option<String> = row.get(19)?;
+            let source_str: String = row.get(20)?;
+            let error_message: Option<String> = row.get(21)?;
+            let created_at_str: String = row.get(22)?;
+            let completed_at_str: Option<String> = row.get(23)?;
 
             let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
             let headers: BTreeMap<String, String> =
                 serde_json::from_str(&headers_json).unwrap_or_default();
             let checksum: Option<ChecksumSpec> = checksum_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            let selected_files: Option<Vec<usize>> = selected_files_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok());
             let source: TaskSource =
@@ -356,6 +370,7 @@ impl TaskStore {
                 category: FileCategory::from_str_lossy(&category_str),
                 matched_rule,
                 checksum,
+                selected_files,
                 source,
                 error_message,
                 created_at,
@@ -507,6 +522,7 @@ mod tests {
             category: FileCategory::DiskImage,
             matched_rule: Some("系统镜像自动归档".into()),
             checksum: None,
+            selected_files: Some(vec![0, 2, 5]),
             source: TaskSource::Manual,
             error_message: None,
             created_at: Utc::now(),
@@ -540,6 +556,7 @@ mod tests {
         let loaded = store.load_all_tasks().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].status, TaskStatus::Paused);
+        assert_eq!(loaded[0].selected_files.as_deref(), Some(&[0usize, 2, 5][..]));
         assert_eq!(loaded[0].segments.len(), 2);
         assert_eq!(loaded[0].segments[0].state, SegmentState::Pending);
 

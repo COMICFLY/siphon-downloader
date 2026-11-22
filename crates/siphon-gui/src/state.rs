@@ -93,6 +93,10 @@ pub enum InputTarget {
     SniffPageUrl,
     SniffSearch,
     SniffSaveDir,
+    P2pSourceInput,
+    P2pEd2kInput,
+    P2pSearch,
+    P2pSaveDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +194,86 @@ pub struct SniffPopupState {
     pub search: String,
     pub save_dir: String,
     pub connections: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum P2pSelectTab {
+    #[default]
+    Torrent,
+    Ed2k,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum P2pFileFilter {
+    #[default]
+    All,
+    Video,
+    Audio,
+    ArchiveIso,
+    DocImage,
+    Other,
+}
+
+impl P2pFileFilter {
+    pub fn matches_filename(self, path: &str) -> bool {
+        if self == Self::All {
+            return true;
+        }
+        let cat = FileCategory::from_filename_and_mime(path, None);
+        match self {
+            Self::All => true,
+            Self::Video => cat == FileCategory::Video,
+            Self::Audio => cat == FileCategory::Audio,
+            Self::ArchiveIso => matches!(
+                cat,
+                FileCategory::Archive | FileCategory::DiskImage | FileCategory::Software
+            ),
+            Self::DocImage => matches!(cat, FileCategory::Document | FileCategory::Image),
+            Self::Other => cat == FileCategory::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TorrentSelectItem {
+    pub index: usize,
+    pub path: String,
+    pub size: u64,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ed2kSelectItem {
+    pub id: usize,
+    pub raw_url: String,
+    pub filename: String,
+    pub file_size: u64,
+    pub md4_hash: String,
+    pub aich_hash: Option<String>,
+    pub web_sources: usize,
+    pub peer_sources: usize,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct P2pSelectPopupState {
+    pub window_id: Option<window::Id>,
+    pub window_hwnd: Option<u64>,
+    pub tab: P2pSelectTab,
+    pub source_input: String,
+    pub normalized_bt_url: String,
+    pub torrent_name: String,
+    pub info_hash: String,
+    pub inspecting_bt: bool,
+    pub bt_error: Option<String>,
+    pub bt_files: Vec<TorrentSelectItem>,
+    pub ed2k_input: String,
+    pub ed2k_error: Option<String>,
+    pub ed2k_items: Vec<Ed2kSelectItem>,
+    pub next_ed2k_id: usize,
+    pub filter: P2pFileFilter,
+    pub search: String,
+    pub save_dir: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,6 +387,38 @@ pub enum Message {
     SniffConnectionsChanged(f32),
     SniffDownloadSingle(usize),
     SniffDownloadSelected(bool),
+
+    // Standalone BitTorrent (.torrent / Magnet) & eD2k Selective Download Window
+    OpenP2pSelectPopup(P2pSelectTab, Option<String>),
+    P2pWindowOpened(window::Id),
+    P2pWindowRawId(u64),
+    P2pDragWindow,
+    P2pClose,
+    P2pSetTab(P2pSelectTab),
+    P2pSourceInputChanged(String),
+    P2pPickTorrentFile,
+    P2pTorrentFilePicked(Option<PathBuf>),
+    P2pInspectTorrent,
+    P2pInspectTorrentFinished(std::result::Result<siphon_engine_bt::TorrentInspectInfo, String>),
+    P2pToggleBtFile(usize),
+    P2pBtSelectLargeOnly,
+    P2pSubmitBtDirect(bool),
+    P2pSubmitBtSelected(bool),
+    P2pEd2kInputChanged(String),
+    P2pParseEd2kInput,
+    P2pImportEd2kClipboard,
+    P2pToggleEd2kItem(usize),
+    P2pRemoveEd2kItem(usize),
+    P2pClearEd2kItems,
+    P2pDownloadSingleEd2k(usize),
+    P2pSubmitEd2kSelected(bool),
+    P2pSetFilter(P2pFileFilter),
+    P2pSearchChanged(String),
+    P2pSelectAllVisible(bool),
+    P2pInvertSelection,
+    P2pSaveDirChanged(String),
+    P2pBrowseDir,
+    P2pDirPicked(Option<PathBuf>),
 
     // Standalone Per-Task Download Progress Detail Popup Window
     OpenTaskDetailPopup(TaskId),

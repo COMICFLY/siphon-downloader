@@ -330,6 +330,9 @@ pub struct DownloadTask {
     pub category: FileCategory,
     pub matched_rule: Option<String>,
     pub checksum: Option<ChecksumSpec>,
+    /// Optional 0-based sub-file indices selected for multi-file BitTorrent tasks (`None` = all files).
+    #[serde(default)]
+    pub selected_files: Option<Vec<usize>>,
     pub source: TaskSource,
     pub error_message: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -439,6 +442,9 @@ pub struct NewTaskRequest {
     pub speed_limit_bps: Option<u64>,
     pub headers: BTreeMap<String, String>,
     pub checksum: Option<ChecksumSpec>,
+    /// Optional 0-based sub-file indices selected for multi-file BitTorrent tasks (`None` = all files).
+    #[serde(default)]
+    pub selected_files: Option<Vec<usize>>,
     pub source: TaskSource,
     pub auto_start: bool,
 }
@@ -453,6 +459,7 @@ impl NewTaskRequest {
             speed_limit_bps: None,
             headers: BTreeMap::new(),
             checksum: None,
+            selected_files: None,
             source,
             auto_start: true,
         }

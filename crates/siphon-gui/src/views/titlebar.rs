@@ -1,6 +1,6 @@
 use crate::i18n::Strings;
 use crate::icons::{IconKind, icon};
-use crate::state::{InputTarget, Message};
+use crate::state::{InputTarget, Message, P2pSelectTab};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette, hairline_rule_style,
     outline_btn_style, panel_style, primary_btn_style, seamless_input_style, subtle_btn_style,
@@ -109,7 +109,7 @@ pub fn view<'a>(
         .align_y(Alignment::Center),
     )
     .height(Length::Fixed(34.0))
-    .width(Length::Fixed(360.0))
+    .width(Length::Fixed(316.0))
     .padding([0, 10])
     .align_y(Alignment::Center)
     .style(panel_style(palette.bg_input, Some(palette.hairline), 8.0));
@@ -157,6 +157,30 @@ pub fn view<'a>(
     .padding([0, 12])
     .style(outline_btn_style(palette))
     .on_press(Message::OpenEmptySniffPopup);
+
+    let p2p_btn = button(
+        container(
+            row![
+                icon(IconKind::Magnet, 13.0, palette.accent),
+                text(if strings.lang == siphon_core::Language::ZhCn {
+                    "种子/eD2k"
+                } else {
+                    "BT/eD2k"
+                })
+                .size(13)
+                .font(FONT_MEDIUM)
+                .wrapping(text::Wrapping::None),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .height(Length::Fill)
+        .align_y(Alignment::Center),
+    )
+    .height(Length::Fixed(34.0))
+    .padding([0, 12])
+    .style(outline_btn_style(palette))
+    .on_press(Message::OpenP2pSelectPopup(P2pSelectTab::Torrent, None));
 
     // Only drag_spacer uses Length::Fill so right-side window controls NEVER stretch in fullscreen!
     let drag_spacer = mouse_area(container(space()).width(Length::Fill).height(Length::Fill))
@@ -214,8 +238,15 @@ pub fn view<'a>(
     .spacing(2)
     .align_y(Alignment::Center);
 
-    let main_header_bay = row![search_shell, new_btn, sniff_btn, drag_spacer, right_controls]
-        .spacing(12)
+    let main_header_bay = row![
+        search_shell,
+        new_btn,
+        sniff_btn,
+        p2p_btn,
+        drag_spacer,
+        right_controls
+    ]
+    .spacing(10)
         .padding(iced::Padding {
             top: 0.0,
             right: 12.0,

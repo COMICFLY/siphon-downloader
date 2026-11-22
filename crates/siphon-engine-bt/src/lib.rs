@@ -55,6 +55,25 @@ struct WarmSession {
     session: Arc<Session>,
 }
 
+/// Single sub-file entry inside a BitTorrent `.torrent` or Magnet metadata payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentFileEntry {
+    pub index: usize,
+    pub path: String,
+    pub size: u64,
+    pub is_padding: bool,
+}
+
+/// Parsed metadata and sub-file listing returned by `BitTorrentEngine::inspect_torrent`.
+#[derive(Debug, Clone)]
+pub struct TorrentInspectInfo {
+    pub normalized_url: String,
+    pub name: String,
+    pub info_hash: String,
+    pub total_size: u64,
+    pub files: Vec<TorrentFileEntry>,
+}
+
 /// Pure-Rust BitTorrent / Magnet download engine powered by `librqbit`,
 /// using a long-lived pre-warmed shared session with persisted DHT routing table,
 /// TCP+uTP listeners, and full custom tracker injection for instant task startup.
@@ -142,6 +161,140 @@ impl BitTorrentEngine {
             session: Arc::clone(&session),
         });
         Ok((session, false))
+    }
+
+    /// Inspect a `.torrent` file (local path, `file://`, `http(s)://`) or `magnet:?` link
+    /// without starting the download, returning its full sub-file list for selective download.
+    pub async fn inspect_torrent(
+        &self,
+        raw_input: &str,
+        bt: &BtConfig,
+        fallback_dir: &Path,
+        proxy_url: Option<&str>,
+    ) -> std::result::Result<TorrentInspectInfo, String> {
+        let trimmed = raw_input.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            return Err("请输入磁力链接、种子直链或选择本地 .torrent 文件".to_string());
+        }
+
+        // Normalize a bare local `.torrent` path into a `file:///` URL cleanly
+        let (normalized_url, local_path) = if let Some(p) = local_torrent_path_from_url(trimmed) {
+            (trimmed.to_string(), Some(p))
+        } else {
+            let candidate_path = PathBuf::from(trimmed);
+            if candidate_path.is_file()
+                && candidate_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+            {
+                let file_url = Url::from_file_path(&candidate_path)
+                    .map(|u| u.to_string())
+                    .map_err(|_| format!("无法解析本地种子路径: {}", candidate_path.display()))?;
+                (file_url, Some(candidate_path))
+            } else {
+                (trimmed.to_string(), None)
+            }
+        };
+
+        if !is_bittorrent_url(&normalized_url) {
+            return Err("仅支持 magnet:? 磁力链接、.torrent 种子链接或本地 .torrent 文件".to_string());
+        }
+
+        let add_req = if let Some(path) = local_path {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("读取本地种子文件失败 ({}): {e}", path.display()))?;
+            AddTorrent::from_bytes(bytes)
+        } else {
+            AddTorrent::from_url(&normalized_url)
+        };
+
+        let (session, _reused) = self
+            .get_or_create_session(bt, fallback_dir, proxy_url)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut opts = build_add_torrent_options_for_dir(bt, Some(fallback_dir));
+        opts.list_only = true;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(45),
+            session.add_torrent(add_req, Some(opts)),
+        )
+        .await
+        .map_err(|_| {
+            "获取磁力链接元数据超时（45 秒内暂未找到持有元数据的 Peer，可直接点击「不等待列表直接下载」）"
+                .to_string()
+        })?
+        .map_err(|e| format!("解析种子/磁力元数据失败: {e}"))?;
+
+        match response {
+            AddTorrentResponse::ListOnly(lo) => {
+                let info_hash = lo.info_hash.as_string();
+                let name = lo
+                    .info
+                    .name()
+                    .map(|n| sanitize_bt_name(&n))
+                    .unwrap_or_else(|| format!("torrent-{}", &info_hash[..info_hash.len().min(12)]));
+                let mut files = Vec::new();
+                let mut total_size = 0u64;
+                for (index, details) in lo.info.iter_file_details().enumerate() {
+                    let is_padding = details.attrs().padding;
+                    let size = details.len;
+                    if !is_padding {
+                        total_size = total_size.saturating_add(size);
+                    }
+                    files.push(TorrentFileEntry {
+                        index,
+                        path: details.filename.to_string(),
+                        size,
+                        is_padding,
+                    });
+                }
+                Ok(TorrentInspectInfo {
+                    normalized_url,
+                    name,
+                    info_hash,
+                    total_size,
+                    files,
+                })
+            }
+            AddTorrentResponse::AlreadyManaged(_, handle)
+            | AddTorrentResponse::Added(_, handle) => {
+                let info_hash = handle.info_hash().as_string();
+                let name = handle
+                    .name()
+                    .map(|n| sanitize_bt_name(&n))
+                    .unwrap_or_else(|| format!("torrent-{}", &info_hash[..info_hash.len().min(12)]));
+                let files = handle
+                    .with_metadata(|meta| {
+                        let mut list = Vec::new();
+                        for (index, details) in meta.info.iter_file_details().enumerate() {
+                            list.push(TorrentFileEntry {
+                                index,
+                                path: details.filename.to_string(),
+                                size: details.len,
+                                is_padding: details.attrs().padding,
+                            });
+                        }
+                        list
+                    })
+                    .unwrap_or_default();
+                let total_size = files
+                    .iter()
+                    .filter(|f| !f.is_padding)
+                    .map(|f| f.size)
+                    .sum();
+                Ok(TorrentInspectInfo {
+                    normalized_url,
+                    name,
+                    info_hash,
+                    total_size,
+                    files,
+                })
+            }
+        }
     }
 }
 
@@ -310,6 +463,14 @@ pub fn build_add_torrent_options_for_dir(
     bt: &BtConfig,
     output_dir: Option<&Path>,
 ) -> AddTorrentOptions {
+    build_add_torrent_options_with_files(bt, output_dir, None)
+}
+
+pub fn build_add_torrent_options_with_files(
+    bt: &BtConfig,
+    output_dir: Option<&Path>,
+    only_files: Option<&[usize]>,
+) -> AddTorrentOptions {
     let trackers = if bt.auto_append_trackers && !bt.disable_trackers {
         let list = bt.effective_trackers();
         if list.is_empty() { None } else { Some(list) }
@@ -317,9 +478,14 @@ pub fn build_add_torrent_options_for_dir(
         None
     };
 
+    let only_files_opt = only_files
+        .filter(|list| !list.is_empty())
+        .map(|list| list.to_vec());
+
     AddTorrentOptions {
         overwrite: true,
         output_folder: output_dir.map(|p| p.to_string_lossy().to_string()),
+        only_files: only_files_opt,
         disable_trackers: bt.disable_trackers,
         peer_limit: Some(bt.max_peers_per_torrent.clamp(10, 500)),
         force_tracker_interval: Some(Duration::from_secs(60)),
@@ -467,17 +633,26 @@ impl ProtocolHandler for BitTorrentEngine {
             .get_or_create_session(&ctx.bt_config, &output_dir, ctx.proxy_url.as_deref())
             .await?;
 
-        let add_opts = build_add_torrent_options_for_dir(&ctx.bt_config, Some(&output_dir));
+        let add_opts = build_add_torrent_options_with_files(
+            &ctx.bt_config,
+            Some(&output_dir),
+            ctx.task.selected_files.as_deref(),
+        );
         let tracker_count = add_opts.trackers.as_ref().map(|v| v.len()).unwrap_or(0);
+        let selected_note = match ctx.task.selected_files.as_ref() {
+            Some(files) if !files.is_empty() => format!("，仅下载勾选的 {} 个子文件", files.len()),
+            _ => String::new(),
+        };
         push_log(
             &ctx,
             "info",
             format!(
-                "BitTorrent 会话{}（{} ms，TCP+uTP，DHT={}，注入 Tracker={} 条）-> {}",
+                "BitTorrent 会话{}（{} ms，TCP+uTP，DHT={}，注入 Tracker={} 条{}）-> {}",
                 if reused { "热复用" } else { "已初始化" },
                 t0.elapsed().as_millis(),
                 ctx.bt_config.enable_dht,
                 tracker_count,
+                selected_note,
                 output_dir.display()
             ),
         );
@@ -842,5 +1017,56 @@ mod tests {
         assert!(!Arc::ptr_eq(&s1, &s3));
 
         s3.stop().await;
+    }
+
+    #[tokio::test]
+    async fn inspect_local_multi_file_torrent_lists_all_subfiles_and_only_files_options() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build a valid bencoded multi-file `.torrent` with 3 sub-files (total 3000 bytes, 1 piece of 16384 bytes)
+        let mut torrent_bytes: Vec<u8> = Vec::new();
+        torrent_bytes.extend_from_slice(b"d4:infod5:filesl");
+        torrent_bytes.extend_from_slice(b"d6:lengthi1500e4:pathl7:Season18:EP01.mkvee");
+        torrent_bytes.extend_from_slice(b"d6:lengthi1200e4:pathl7:Season18:EP02.mkvee");
+        torrent_bytes.extend_from_slice(b"d6:lengthi300e4:pathl10:README.txtee");
+        torrent_bytes.extend_from_slice(b"e4:name12:SampleSeries12:piece lengthi16384e6:pieces20:");
+        torrent_bytes.extend_from_slice(&[0xABu8; 20]);
+        torrent_bytes.extend_from_slice(b"ee");
+
+        let torrent_path = dir.path().join("sample_series.torrent");
+        std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+
+        let engine = BitTorrentEngine::with_data_dir(dir.path().to_path_buf());
+        let bt = BtConfig {
+            enable_dht: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            disable_trackers: true,
+            listen_port: 0,
+            auto_append_trackers: false,
+            ..Default::default()
+        };
+
+        let info = engine
+            .inspect_torrent(
+                &torrent_path.to_string_lossy(),
+                &bt,
+                dir.path(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(info.name, "SampleSeries");
+        assert_eq!(info.total_size, 3000);
+        assert_eq!(info.files.len(), 3);
+        assert!(info.normalized_url.starts_with("file:///"));
+        assert_eq!(info.files[0].index, 0);
+        assert_eq!(info.files[0].size, 1500);
+        assert!(info.files[0].path.contains("EP01.mkv"));
+        assert_eq!(info.files[1].size, 1200);
+        assert_eq!(info.files[2].size, 300);
+
+        let add = build_add_torrent_options_with_files(&bt, Some(dir.path()), Some(&[0, 1]));
+        assert_eq!(add.only_files, Some(vec![0, 1]));
     }
 }

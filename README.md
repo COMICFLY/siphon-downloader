@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.6.0-38BDF8?style=flat-square" alt="Release" /></a>
+  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.7.0-38BDF8?style=flat-square" alt="Release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-0EA5E9?style=flat-square" alt="Platform" />
   <img src="https://img.shields.io/badge/language-Rust%202024-F97316?style=flat-square" alt="Rust" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="License" /></a>
@@ -40,9 +40,12 @@
 - **计划调度与下载完成动作（Scheduler）**：支持每日**定时自动开始/暂停下载队列**、**分时段自动全局限速**（支持跨午夜时段，离开时段后自动恢复默认限速），以及队列全部下载完成后自动执行 **退出软件 / 系统睡眠 / 系统休眠 / 30 秒倒计时关机 / 自定义 PowerShell 脚本**（默认开启单次触发自动重置保护）。
 - **批量通配符队列导入**：新建任务弹窗支持切换至「批量通配符队列」模式，支持 `[001-100]` 零填充数字区间、`[1-20:2]` 步长、`[a-z]` 字母范围、多通配符笛卡尔展开、剪贴板多行链接一键导入、关键词/后缀过滤与实时展开预览。
 
-### 3. 独立悬浮捕获窗、嗅探资源选择性下载窗 & 独立下载详情窗
+### 3. 独立悬浮捕获窗、嗅探选择窗、种子/eD2k 选择窗 & 独立下载详情窗
 - **独立悬浮捕获小窗**：即使主窗口最小化常驻托盘，捕获到浏览器或剪贴板下载链接时也会独立置顶弹出，支持修改文件名、选择保存目录、查看断点续传/匹配规则/浏览器凭证状态，并提供 **开始下载 / 后台下载 / 稍后下载 / 取消** 四种动作。
 - **嗅探资源选择性下载窗**：支持从顶栏「资源嗅探」按钮直接打开并输入任意网页链接嗅探，或由浏览器扩展深度扫描（含 `<iframe>` 内嵌播放器、`performance` 已加载资源与 `<script>` 转义流地址）实时同步；窗口内支持按类型筛选（HLS/MPD、视频、音频、文件、磁力/eD2k、图片）、关键词搜索、**全选 / 反选 / 并发探测未知文件大小 / 预计选中总大小汇总**、自定义保存目录与并发线程数，勾选所需项后一键下载或加入暂停队列。
+- **种子 / eD2k 资源选择下载窗**：支持从顶栏「种子/eD2k」、BT/eD2k 协议页、拖入 `.torrent` 文件或捕获 `magnet:?` / `ed2k://` 链接自动打开：
+  - **BT 种子 / 磁力子文件选择**：秒级展开本地 `.torrent` 或通过预热会话解析磁力链接完整子文件列表，支持按视频/音频/压缩包镜像/文档筛选、关键词过滤、全选/反选/**仅选大文件 (>10MB)** 与预计下载大小统计，按需只下载勾选子文件（SQLite 持久化断点续传，同时支持磁力链接不等待列表直接开始下载）；
+  - **eD2k 电驴资源选择**：支持单条、多行批量或整段网页文本/剪贴板一键自动提取全部 `ed2k://|file|...` 链接（按 MD4 哈希自动去重），展示精确文件大小、9.28MB 分块数、Web 源/节点源/AICH 状态，自由勾选后批量下载或加入暂停队列。
 - **独立下载详情监控窗**：点击「开始下载」后弹出独立任务监控窗，集中呈现传输状态、实时速率、剩余时间、60 秒吞吐曲线与连续无缝分片进度条；支持**转入后台**、**下载完成后自动关闭窗口**、完成后一键打开文件或定位所在目录。
 
 ### 4. Chrome / Edge 浏览器下载捕获扩展（MV3 独立分发 + 自动拉起客户端）
@@ -77,7 +80,8 @@
 - [x] **定时任务与队列调度器**（v0.3.0）：支持每日定时启停队列、分时段自动限速、全部下载完成后自动退出 / 睡眠 / 休眠 / 关机 / 执行自定义脚本。
 - [x] **批量通配符队列导入**（v0.3.0）：支持 `[001-100]`、`[1-20:2]`、`[a-z]` 序号/字母通配符展开、多行粘贴与关键词过滤预览。
 - [x] **应用内一键下载并自动静默更新**（v0.3.0）：软件内实时进度下载新版本安装包，完成后自动静默覆盖升级并重启。
-- [ ] **DASH（`.mpd`）音视频分离流封装与 BT 文件勾选**：支持 DASH 音视频轨合并封装为 MP4 / MKV，以及 BitTorrent 多文件任务按需勾选子文件。
+- [x] **BitTorrent 多文件按需勾选与 eD2k 资源选择窗**（v0.7.0）：独立「种子 / eD2k 选择下载窗」，支持 `.torrent` / `magnet:?` 子文件精确勾选下载及批量 `ed2k://` 链接解析去重勾选。
+- [ ] **DASH（`.mpd`）音视频分离流封装**：支持 DASH 音视频轨合并封装为 MP4 / MKV。
 - [ ] **站点凭证与高级网络控制**：支持按域名独立配置 HTTP Basic / Cookie / 自定义 Header、分域名限速、以及 HTTP/SOCKS5 代理分流规则。
 - [ ] **局域网 / WebUI 远程管理**：内置轻量 REST API 与 Web 控制台，支持手机或局域网其他设备远程推送下载任务并查看进度。
 
@@ -87,11 +91,11 @@
 
 前往 [**GitHub Releases**](https://github.com/COMICFLY/siphon-downloader/releases) 下载对应文件：
 
-1. **`Siphon-Setup-0.6.0-x64.exe`（推荐）**：标准 Windows 安装包
+1. **`Siphon-Setup-0.7.0-x64.exe`（推荐）**：标准 Windows 安装包
    - 支持自由选择**程序安装目录**与**数据存储目录**；
    - 支持勾选创建桌面快捷方式与**开机静默启动**；
-   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.6.0.zip` 扩展压缩包。
-2. **`siphon-browser-extension-v0.6.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
+   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.7.0.zip` 扩展压缩包。
+2. **`siphon-browser-extension-v0.7.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
    - 解压后打开浏览器的 `chrome://extensions` 或 `edge://extensions`；
    - 开启右上角 **「开发者模式」**，将解压出的文件夹直接拖入浏览器扩展页即可完成加载。
 

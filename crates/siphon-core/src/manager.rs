@@ -311,6 +311,7 @@ impl DownloadManager {
                 speed_limit_bps: Some(task.speed_limit_bps),
                 headers: extra.headers,
                 checksum: None,
+                selected_files: None,
                 source: TaskSource::Plugin,
                 auto_start: should_start,
             };
@@ -420,6 +421,7 @@ impl DownloadManager {
             category: rule_match.category_override.unwrap_or(initial_category),
             matched_rule: rule_match.matched_rules.first().cloned(),
             checksum: req.checksum,
+            selected_files: req.selected_files,
             source: req.source,
             error_message: None,
             created_at: Utc::now(),

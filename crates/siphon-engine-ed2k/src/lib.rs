@@ -5,7 +5,6 @@ pub mod server_met;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::StreamExt;
-use link::{Ed2kFileLink, is_ed2k_file_link, parse_ed2k_file_link};
 use md4::ed2k_file_hash_path;
 use server_met::{build_get_sources_packet, build_login_packet};
 use siphon_core::{
@@ -17,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub use link::{parse_ed2k_server_link};
+pub use link::{Ed2kFileLink, extract_ed2k_file_links, is_ed2k_file_link, parse_ed2k_file_link, parse_ed2k_server_link};
 pub use md4::{ed2k_file_hash_hex, md4_digest};
 pub use server_met::{parse_server_met_bytes, sync_servers_from_met, test_ed2k_server};
 

@@ -2,8 +2,9 @@ use crate::i18n::Strings;
 use crate::icons::{IconKind, icon};
 use crate::state::{
     CaptureAction, CapturePopupState, ContextMenuState, DeleteConfirmState, DownloadPopupState,
-    ExtInstallModalState, InputTarget, Message, NavSection, NewTaskModalState, RuleDraft,
-    ServerTestStatus, SniffEntry, SniffFilterKind, SniffPopupState, UpdateCheckStatus,
+    Ed2kSelectItem, ExtInstallModalState, InputTarget, Message, NavSection, NewTaskModalState,
+    P2pFileFilter, P2pSelectPopupState, P2pSelectTab, RuleDraft, ServerTestStatus, SniffEntry,
+    SniffFilterKind, SniffPopupState, TorrentSelectItem, UpdateCheckStatus,
 };
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, SiphonPalette, hairline_rule_style, modal_card_style,
@@ -25,9 +26,10 @@ use siphon_core::{
     infer_filename_from_raw_url, is_time_in_window, parse_hhmm, parse_tracker_list,
     sanitize_filename,
 };
-use siphon_engine_bt::{BitTorrentEngine, sync_trackers_from_urls};
+use siphon_engine_bt::{BitTorrentEngine, is_bittorrent_url, sync_trackers_from_urls};
 use siphon_engine_ed2k::{
-    Ed2kEngine, parse_ed2k_server_link, sync_servers_from_met, test_ed2k_server,
+    Ed2kEngine, extract_ed2k_file_links, is_ed2k_file_link, parse_ed2k_server_link,
+    sync_servers_from_met, test_ed2k_server,
 };
 use siphon_engine_hls::HlsEngine;
 use siphon_engine_http::{HttpEngine, check_for_updates, probe_urls_sizes, sniff_webpage_url};
@@ -142,6 +144,7 @@ pub struct SiphonApp {
     cursor_pos: Point,
     capture_cursor_pos: Point,
     sniff_cursor_pos: Point,
+    p2p_cursor_pos: Point,
     active_input: InputTarget,
     context_menu: Option<ContextMenuState>,
     drag_hovering: bool,
@@ -176,6 +179,7 @@ pub struct SiphonApp {
     author_avatar_handle: image::Handle,
     capture_popup: Option<CapturePopupState>,
     sniff_popup: Option<SniffPopupState>,
+    p2p_popup: Option<P2pSelectPopupState>,
     download_popups: HashMap<window::Id, DownloadPopupState>,
     rule_draft: RuleDraft,
 
@@ -306,6 +310,7 @@ impl SiphonApp {
             cursor_pos: Point::ORIGIN,
             capture_cursor_pos: Point::ORIGIN,
             sniff_cursor_pos: Point::ORIGIN,
+            p2p_cursor_pos: Point::ORIGIN,
             active_input: InputTarget::QuickBar,
             context_menu: None,
             drag_hovering: false,
@@ -340,6 +345,7 @@ impl SiphonApp {
             author_avatar_handle,
             capture_popup: None,
             sniff_popup: None,
+            p2p_popup: None,
             download_popups: HashMap::new(),
             rule_draft: RuleDraft {
                 save_dir_template: r"{base}\{domain}".to_string(),
@@ -415,6 +421,22 @@ impl SiphonApp {
         {
             return format!("Siphon 嗅探资源选择性下载 ({} 项)", sniff.items.len());
         }
+        if let Some(p2p) = &self.p2p_popup
+            && p2p.window_id == Some(window_id)
+        {
+            return match p2p.tab {
+                P2pSelectTab::Torrent => {
+                    if !p2p.torrent_name.is_empty() {
+                        format!("Siphon 种子选择 — {}", p2p.torrent_name)
+                    } else {
+                        "Siphon 种子 / 磁力文件选择".to_string()
+                    }
+                }
+                P2pSelectTab::Ed2k => {
+                    format!("Siphon eD2k 资源选择 ({} 项)", p2p.ed2k_items.len())
+                }
+            };
+        }
         if let Some(dp) = self.download_popups.get(&window_id) {
             if let Some(task) = self.tasks.iter().find(|t| t.id == dp.task_id) {
                 if task.status == TaskStatus::Completed {
@@ -465,6 +487,9 @@ impl SiphonApp {
             apply_win11_backdrop(hwnd, self.config.use_mica, p.is_dark);
         }
         if let Some(hwnd) = self.sniff_popup.as_ref().and_then(|s| s.window_hwnd) {
+            apply_win11_backdrop(hwnd, self.config.use_mica, p.is_dark);
+        }
+        if let Some(hwnd) = self.p2p_popup.as_ref().and_then(|s| s.window_hwnd) {
             apply_win11_backdrop(hwnd, self.config.use_mica, p.is_dark);
         }
         for dp in self.download_popups.values() {
@@ -863,6 +888,163 @@ impl SiphonApp {
         })
     }
 
+    fn merge_ed2k_text_into_p2p(p2p: &mut P2pSelectPopupState, raw: &str) -> usize {
+        let parsed = extract_ed2k_file_links(raw);
+        let mut added = 0usize;
+        for (raw_url, link) in parsed {
+            if p2p
+                .ed2k_items
+                .iter()
+                .any(|e| e.md4_hash.eq_ignore_ascii_case(&link.md4_hash))
+            {
+                continue;
+            }
+            let id = p2p.next_ed2k_id;
+            p2p.next_ed2k_id += 1;
+            p2p.ed2k_items.push(Ed2kSelectItem {
+                id,
+                raw_url,
+                filename: link.filename,
+                file_size: link.file_size,
+                md4_hash: link.md4_hash,
+                aich_hash: link.aich_hash,
+                web_sources: link.web_sources.len(),
+                peer_sources: link.peer_sources.len(),
+                selected: true,
+            });
+            added += 1;
+        }
+        added
+    }
+
+    /// Open or focus the standalone BitTorrent (.torrent / Magnet) & eD2k selective download window.
+    fn open_or_update_p2p_popup(
+        &mut self,
+        tab: P2pSelectTab,
+        initial_input: Option<String>,
+    ) -> Task<Message> {
+        self.modal.open = false;
+        let trimmed_input = initial_input
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if let Some(existing) = &mut self.p2p_popup {
+            existing.tab = tab;
+            existing.filter = P2pFileFilter::All;
+            existing.search.clear();
+            let mut auto_inspect_bt = false;
+
+            if let Some(val) = trimmed_input {
+                match tab {
+                    P2pSelectTab::Torrent => {
+                        existing.source_input = val;
+                        existing.bt_error = None;
+                        existing.bt_files.clear();
+                        existing.torrent_name.clear();
+                        existing.info_hash.clear();
+                        auto_inspect_bt = true;
+                    }
+                    P2pSelectTab::Ed2k => {
+                        let added = Self::merge_ed2k_text_into_p2p(existing, &val);
+                        if added > 0 {
+                            existing.ed2k_input.clear();
+                            existing.ed2k_error = None;
+                        } else {
+                            existing.ed2k_input = val;
+                        }
+                    }
+                }
+            }
+
+            let mut tasks = Vec::new();
+            if let Some(hwnd) = existing.window_hwnd {
+                show_window_native(hwnd);
+            }
+            if let Some(wid) = existing.window_id {
+                tasks.push(window::gain_focus(wid));
+            }
+            if auto_inspect_bt {
+                tasks.push(self.update(Message::P2pInspectTorrent));
+            }
+            return Task::batch(tasks);
+        }
+
+        let (rgba, w, h) = siphon_platform_win::generate_siphon_icon_rgba();
+        let app_icon = window::icon::from_rgba(rgba, w, h).ok();
+        let settings = window::Settings {
+            size: iced::Size::new(820.0, 600.0),
+            min_size: Some(iced::Size::new(700.0, 500.0)),
+            position: window::Position::Centered,
+            decorations: false,
+            transparent: true,
+            resizable: true,
+            visible: true,
+            level: window::Level::AlwaysOnTop,
+            exit_on_close_request: false,
+            icon: app_icon,
+            ..Default::default()
+        };
+        let (wid, open_task) = window::open(settings);
+
+        let mut state = P2pSelectPopupState {
+            window_id: Some(wid),
+            window_hwnd: None,
+            tab,
+            source_input: String::new(),
+            normalized_bt_url: String::new(),
+            torrent_name: String::new(),
+            info_hash: String::new(),
+            inspecting_bt: false,
+            bt_error: None,
+            bt_files: Vec::new(),
+            ed2k_input: String::new(),
+            ed2k_error: None,
+            ed2k_items: Vec::new(),
+            next_ed2k_id: 1,
+            filter: P2pFileFilter::All,
+            search: String::new(),
+            save_dir: self.config.default_save_dir.to_string_lossy().to_string(),
+        };
+
+        let mut auto_inspect_bt = false;
+        if let Some(val) = trimmed_input {
+            match tab {
+                P2pSelectTab::Torrent => {
+                    state.source_input = val;
+                    auto_inspect_bt = true;
+                }
+                P2pSelectTab::Ed2k => {
+                    let added = Self::merge_ed2k_text_into_p2p(&mut state, &val);
+                    if added == 0 {
+                        state.ed2k_input = val;
+                    }
+                }
+            }
+        }
+
+        self.p2p_popup = Some(state);
+        self.context_menu = None;
+        self.active_input = match tab {
+            P2pSelectTab::Torrent => InputTarget::P2pSourceInput,
+            P2pSelectTab::Ed2k => InputTarget::P2pEd2kInput,
+        };
+
+        let open_chain = open_task.then(|id| {
+            Task::batch([
+                Task::done(Message::P2pWindowOpened(id)),
+                window::raw_id::<()>(id).map(Message::P2pWindowRawId),
+                window::gain_focus(id),
+            ])
+        });
+
+        if auto_inspect_bt {
+            let inspect_task = self.update(Message::P2pInspectTorrent);
+            Task::batch([open_chain, inspect_task])
+        } else {
+            open_chain
+        }
+    }
+
     /// Open or focus the standalone download progress detail popup window for `task_id`.
     fn open_download_detail_popup(&mut self, task_id: TaskId) -> Task<Message> {
         if let Some(existing) = self
@@ -922,6 +1104,13 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     return window::raw_id::<()>(id).map(Message::SniffWindowRawId);
+                }
+                if self
+                    .p2p_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    return window::raw_id::<()>(id).map(Message::P2pWindowRawId);
                 }
                 if self.download_popups.contains_key(&id) {
                     return window::raw_id::<()>(id)
@@ -1022,6 +1211,12 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     self.sniff_cursor_pos = pos;
+                } else if self
+                    .p2p_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    self.p2p_cursor_pos = pos;
                 } else {
                     self.cursor_pos = pos;
                 }
@@ -1041,6 +1236,14 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     self.sniff_popup = None;
+                    return window::close(id);
+                }
+                if self
+                    .p2p_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    self.p2p_popup = None;
                     return window::close(id);
                 }
                 if self.download_popups.remove(&id).is_some() {
@@ -1066,6 +1269,13 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     self.sniff_popup = None;
+                }
+                if self
+                    .p2p_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    self.p2p_popup = None;
                 }
                 self.download_popups.remove(&id);
             }
@@ -1100,13 +1310,28 @@ impl SiphonApp {
                     .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
                     && let Ok(file_url) = url::Url::from_file_path(&path)
                 {
-                    return self.update(Message::OpenNewTaskModal(Some(file_url.to_string())));
+                    return self.open_or_update_p2p_popup(
+                        P2pSelectTab::Torrent,
+                        Some(file_url.to_string()),
+                    );
+                }
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    let ed2k_found = extract_ed2k_file_links(&raw);
+                    if !ed2k_found.is_empty() {
+                        return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(raw));
+                    }
                 }
                 if let Some(url) = extract_url_from_dropped_file(&path) {
+                    if is_bittorrent_url(&url) {
+                        return self.open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(url));
+                    }
+                    if is_ed2k_file_link(&url) {
+                        return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(url));
+                    }
                     return self.update(Message::OpenNewTaskModal(Some(url)));
                 } else {
                     self.toast = Some(format!(
-                        "未在拖入文件 {} 中检测到 HTTP/HTTPS/Magnet 链接或 .torrent 种子",
+                        "未在拖入文件 {} 中检测到 HTTP/HTTPS/Magnet/eD2k 链接或 .torrent 种子",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
                 }
@@ -1127,6 +1352,8 @@ impl SiphonApp {
                     return self.update(Message::CaptureCancel);
                 } else if self.sniff_popup.is_some() {
                     return self.update(Message::SniffClose);
+                } else if self.p2p_popup.is_some() {
+                    return self.update(Message::P2pClose);
                 } else if self.delete_confirm.is_some() {
                     self.delete_confirm = None;
                 } else if self.modal.open {
@@ -1154,6 +1381,14 @@ impl SiphonApp {
                     InputTarget::SniffPageUrl | InputTarget::SniffSearch | InputTarget::SniffSaveDir
                 ) {
                     self.sniff_cursor_pos
+                } else if matches!(
+                    target,
+                    InputTarget::P2pSourceInput
+                        | InputTarget::P2pEd2kInput
+                        | InputTarget::P2pSearch
+                        | InputTarget::P2pSaveDir
+                ) {
+                    self.p2p_cursor_pos
                 } else {
                     self.cursor_pos
                 };
@@ -1174,6 +1409,14 @@ impl SiphonApp {
                             InputTarget::SniffPageUrl
                                 | InputTarget::SniffSearch
                                 | InputTarget::SniffSaveDir
+                        ))
+                    || (self.p2p_popup.is_some()
+                        && matches!(
+                            self.active_input,
+                            InputTarget::P2pSourceInput
+                                | InputTarget::P2pEd2kInput
+                                | InputTarget::P2pSearch
+                                | InputTarget::P2pSaveDir
                         ))
                 {
                     self.active_input
@@ -1455,6 +1698,12 @@ impl SiphonApp {
                             return Task::none();
                         }
                         if self.config.browser_capture_popup {
+                            if is_bittorrent_url(&url) {
+                                return self.open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(url));
+                            }
+                            if is_ed2k_file_link(&url) {
+                                return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(url));
+                            }
                             let payload = BrowserCapturePayload {
                                 url,
                                 filename,
@@ -1473,6 +1722,7 @@ impl SiphonApp {
                         speed_limit_bps: None,
                         headers,
                         checksum: None,
+                        selected_files: None,
                         source: if from_browser {
                             TaskSource::Browser
                         } else {
@@ -1501,6 +1751,14 @@ impl SiphonApp {
                         return Task::none();
                     }
                     if !payload.silent && self.config.browser_capture_popup {
+                        if is_bittorrent_url(&payload.url) {
+                            return self
+                                .open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(payload.url));
+                        }
+                        if is_ed2k_file_link(&payload.url) {
+                            return self
+                                .open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(payload.url));
+                        }
                         return self.open_or_update_capture_popup(payload, TaskSource::Browser);
                     }
                     let headers = payload.merged_headers();
@@ -1517,6 +1775,7 @@ impl SiphonApp {
                         speed_limit_bps: None,
                         headers,
                         checksum: None,
+                        selected_files: None,
                         source: TaskSource::Browser,
                         auto_start: true,
                     };
@@ -1582,6 +1841,12 @@ impl SiphonApp {
             // Clipboard monitor banner or direct floating capture popup
             Message::ClipboardUrlDetected(url) => {
                 if self.config.clipboard_capture_popup {
+                    if is_bittorrent_url(&url) {
+                        return self.open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(url));
+                    }
+                    if is_ed2k_file_link(&url) {
+                        return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(url));
+                    }
                     if self
                         .capture_popup
                         .as_ref()
@@ -1747,6 +2012,7 @@ impl SiphonApp {
                         speed_limit_bps: Some(popup.speed_limit_bps),
                         headers: popup.headers,
                         checksum: None,
+                        selected_files: None,
                         source: popup.source,
                         auto_start,
                     };
@@ -2079,6 +2345,7 @@ impl SiphonApp {
                         speed_limit_bps: None,
                         headers,
                         checksum: None,
+                        selected_files: None,
                         source: TaskSource::Browser,
                         auto_start: true,
                     };
@@ -2131,6 +2398,7 @@ impl SiphonApp {
                                     speed_limit_bps: None,
                                     headers: headers.clone(),
                                     checksum: None,
+                                    selected_files: None,
                                     source: TaskSource::Browser,
                                     auto_start,
                                 };
@@ -2151,6 +2419,557 @@ impl SiphonApp {
                     return submit_task;
                 }
             }
+
+            // Standalone BitTorrent (.torrent / Magnet) & eD2k Selective Download Window
+            Message::OpenP2pSelectPopup(tab, initial) => {
+                return self.open_or_update_p2p_popup(tab, initial);
+            }
+            Message::P2pWindowOpened(id) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.window_id = Some(id);
+                }
+                return window::raw_id::<()>(id).map(Message::P2pWindowRawId);
+            }
+            Message::P2pWindowRawId(hwnd) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.window_hwnd = Some(hwnd);
+                }
+                self.apply_backdrop_now();
+                show_window_native(hwnd);
+                if let Some(shared) = SHARED.get() {
+                    install_window_hooks(hwnd, shared.hook_tx.clone());
+                }
+            }
+            Message::P2pDragWindow => {
+                if let Some(wid) = self.p2p_popup.as_ref().and_then(|p| p.window_id) {
+                    return window::drag(wid);
+                }
+            }
+            Message::P2pClose => {
+                self.context_menu = None;
+                if let Some(p) = self.p2p_popup.take()
+                    && let Some(wid) = p.window_id
+                {
+                    return window::close(wid);
+                }
+            }
+            Message::P2pSetTab(tab) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.tab = tab;
+                    p.filter = P2pFileFilter::All;
+                    p.search.clear();
+                }
+                self.active_input = match tab {
+                    P2pSelectTab::Torrent => InputTarget::P2pSourceInput,
+                    P2pSelectTab::Ed2k => InputTarget::P2pEd2kInput,
+                };
+            }
+            Message::P2pSourceInputChanged(v) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.source_input = v;
+                    p.bt_error = None;
+                }
+            }
+            Message::P2pPickTorrentFile => {
+                let start = self
+                    .p2p_popup
+                    .as_ref()
+                    .map(|p| PathBuf::from(&p.save_dir))
+                    .unwrap_or_else(|| self.config.default_save_dir.clone());
+                return Task::perform(
+                    async move {
+                        let mut dlg = rfd::AsyncFileDialog::new()
+                            .set_title("选择 BitTorrent 种子文件 (.torrent)")
+                            .add_filter("BitTorrent 种子文件", &["torrent"]);
+                        if start.is_dir() {
+                            dlg = dlg.set_directory(start);
+                        }
+                        dlg.pick_file().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::P2pTorrentFilePicked,
+                );
+            }
+            Message::P2pTorrentFilePicked(Some(path)) => {
+                if let Ok(file_url) = url::Url::from_file_path(&path) {
+                    if let Some(p) = &mut self.p2p_popup {
+                        p.tab = P2pSelectTab::Torrent;
+                        p.source_input = file_url.to_string();
+                        p.bt_error = None;
+                    }
+                    return self.update(Message::P2pInspectTorrent);
+                }
+            }
+            Message::P2pTorrentFilePicked(None) => {}
+            Message::P2pInspectTorrent => {
+                let Some(p) = &mut self.p2p_popup else {
+                    return Task::none();
+                };
+                let raw = p.source_input.trim().to_string();
+                if raw.is_empty() || p.inspecting_bt {
+                    return Task::none();
+                }
+                let Some(shared) = SHARED.get() else {
+                    return Task::none();
+                };
+                p.inspecting_bt = true;
+                p.bt_error = None;
+                let bt_engine = Arc::clone(&shared.bt_engine);
+                let bt_cfg = self.config.bt.clone();
+                let out_dir = PathBuf::from(if p.save_dir.trim().is_empty() {
+                    self.config.default_save_dir.to_string_lossy().to_string()
+                } else {
+                    p.save_dir.trim().to_string()
+                });
+                let proxy = self.config.proxy_url.clone();
+                return Task::perform(
+                    async move {
+                        bt_engine
+                            .inspect_torrent(&raw, &bt_cfg, &out_dir, proxy.as_deref())
+                            .await
+                    },
+                    Message::P2pInspectTorrentFinished,
+                );
+            }
+            Message::P2pInspectTorrentFinished(res) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.inspecting_bt = false;
+                    match res {
+                        Ok(info) => {
+                            p.normalized_bt_url = info.normalized_url;
+                            p.torrent_name = info.name;
+                            p.info_hash = info.info_hash;
+                            p.bt_error = None;
+                            p.filter = P2pFileFilter::All;
+                            p.search.clear();
+                            p.bt_files = info
+                                .files
+                                .into_iter()
+                                .filter(|f| !f.is_padding)
+                                .map(|f| TorrentSelectItem {
+                                    index: f.index,
+                                    path: f.path,
+                                    size: f.size,
+                                    selected: true,
+                                })
+                                .collect();
+                        }
+                        Err(e) => {
+                            p.bt_error = Some(e);
+                        }
+                    }
+                }
+            }
+            Message::P2pToggleBtFile(file_idx) => {
+                if let Some(p) = &mut self.p2p_popup
+                    && let Some(item) = p.bt_files.iter_mut().find(|f| f.index == file_idx)
+                {
+                    item.selected = !item.selected;
+                }
+            }
+            Message::P2pBtSelectLargeOnly => {
+                if let Some(p) = &mut self.p2p_popup {
+                    const TEN_MIB: u64 = 10 * 1024 * 1024;
+                    let has_large = p.bt_files.iter().any(|f| f.size >= TEN_MIB);
+                    if has_large {
+                        for f in &mut p.bt_files {
+                            f.selected = f.size >= TEN_MIB;
+                        }
+                    } else {
+                        for f in &mut p.bt_files {
+                            f.selected = true;
+                        }
+                    }
+                }
+            }
+            Message::P2pSubmitBtDirect(auto_start) => {
+                if let Some(p) = self.p2p_popup.take() {
+                    let close_win = p.window_id;
+                    let raw = p.source_input.trim().trim_matches('"').to_string();
+                    if raw.is_empty() {
+                        if let Some(wid) = close_win {
+                            return window::close(wid);
+                        }
+                        return Task::none();
+                    }
+                    let url = {
+                        let cand = PathBuf::from(&raw);
+                        if cand.is_file() {
+                            url::Url::from_file_path(&cand)
+                                .map(|u| u.to_string())
+                                .unwrap_or(raw)
+                        } else {
+                            raw
+                        }
+                    };
+                    let save_dir = {
+                        let d = p.save_dir.trim();
+                        if d.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(d))
+                        }
+                    };
+                    let req = NewTaskRequest {
+                        url,
+                        filename: None,
+                        save_dir,
+                        max_connections: None,
+                        speed_limit_bps: None,
+                        headers: BTreeMap::new(),
+                        checksum: None,
+                        selected_files: None,
+                        source: TaskSource::Manual,
+                        auto_start,
+                    };
+                    self.active_nav = NavSection::All;
+                    self.toast = Some(if auto_start {
+                        "已开始下载 BitTorrent 种子任务".to_string()
+                    } else {
+                        "已将 BitTorrent 种子加入暂停队列".to_string()
+                    });
+                    let mgr = Arc::clone(&self.manager);
+                    let submit = Task::perform(
+                        async move { mgr.add_task(req).await.map_err(|e| e.to_string()) },
+                        if auto_start {
+                            Message::CaptureStartedWithDialog
+                        } else {
+                            |r: std::result::Result<DownloadTask, String>| {
+                                Message::TaskOpFinished(r.map(|_| ()))
+                            }
+                        },
+                    );
+                    if let Some(wid) = close_win {
+                        return Task::batch([window::close(wid), submit]);
+                    }
+                    return submit;
+                }
+            }
+            Message::P2pSubmitBtSelected(auto_start) => {
+                if let Some(p) = self.p2p_popup.take() {
+                    let close_win = p.window_id;
+                    let selected_indices: Vec<usize> = p
+                        .bt_files
+                        .iter()
+                        .filter(|f| f.selected)
+                        .map(|f| f.index)
+                        .collect();
+                    if selected_indices.is_empty() {
+                        if let Some(wid) = close_win {
+                            return window::close(wid);
+                        }
+                        return Task::none();
+                    }
+                    let all_selected = selected_indices.len() == p.bt_files.len();
+                    let url = if !p.normalized_bt_url.is_empty() {
+                        p.normalized_bt_url.clone()
+                    } else {
+                        p.source_input.trim().to_string()
+                    };
+                    let filename = if !p.torrent_name.trim().is_empty() {
+                        Some(p.torrent_name.clone())
+                    } else {
+                        None
+                    };
+                    let save_dir = {
+                        let d = p.save_dir.trim();
+                        if d.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(d))
+                        }
+                    };
+                    let chosen_count = selected_indices.len();
+                    let total_count = p.bt_files.len();
+                    let req = NewTaskRequest {
+                        url,
+                        filename,
+                        save_dir,
+                        max_connections: None,
+                        speed_limit_bps: None,
+                        headers: BTreeMap::new(),
+                        checksum: None,
+                        selected_files: if all_selected {
+                            None
+                        } else {
+                            Some(selected_indices)
+                        },
+                        source: TaskSource::Manual,
+                        auto_start,
+                    };
+                    self.active_nav = NavSection::All;
+                    self.toast = Some(format!(
+                        "已提交种子任务（勾选 {chosen_count}/{total_count} 个子文件，{}）",
+                        if auto_start { "开始下载" } else { "加入暂停队列" }
+                    ));
+                    let mgr = Arc::clone(&self.manager);
+                    let submit = Task::perform(
+                        async move { mgr.add_task(req).await.map_err(|e| e.to_string()) },
+                        if auto_start {
+                            Message::CaptureStartedWithDialog
+                        } else {
+                            |r: std::result::Result<DownloadTask, String>| {
+                                Message::TaskOpFinished(r.map(|_| ()))
+                            }
+                        },
+                    );
+                    if let Some(wid) = close_win {
+                        return Task::batch([window::close(wid), submit]);
+                    }
+                    return submit;
+                }
+            }
+            Message::P2pEd2kInputChanged(v) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.ed2k_input = v;
+                    p.ed2k_error = None;
+                }
+            }
+            Message::P2pParseEd2kInput => {
+                if let Some(p) = &mut self.p2p_popup {
+                    let raw = p.ed2k_input.clone();
+                    if raw.trim().is_empty() {
+                        return Task::none();
+                    }
+                    let added = Self::merge_ed2k_text_into_p2p(p, &raw);
+                    if added > 0 {
+                        p.ed2k_input.clear();
+                        p.ed2k_error = None;
+                    } else {
+                        p.ed2k_error = Some(
+                            "未检测到新的有效 ed2k://|file|... 链接（或均已在列表中）".to_string(),
+                        );
+                    }
+                }
+            }
+            Message::P2pImportEd2kClipboard => {
+                if let Some(p) = &mut self.p2p_popup {
+                    if let Some(raw) = read_clipboard_text() {
+                        let added = Self::merge_ed2k_text_into_p2p(p, &raw);
+                        if added > 0 {
+                            p.ed2k_error = None;
+                        } else {
+                            p.ed2k_error = Some(
+                                "剪贴板中未找到新的有效 ed2k://|file|... 链接".to_string(),
+                            );
+                        }
+                    } else {
+                        p.ed2k_error = Some("当前剪贴板没有文本内容".to_string());
+                    }
+                }
+            }
+            Message::P2pToggleEd2kItem(item_id) => {
+                if let Some(p) = &mut self.p2p_popup
+                    && let Some(item) = p.ed2k_items.iter_mut().find(|i| i.id == item_id)
+                {
+                    item.selected = !item.selected;
+                }
+            }
+            Message::P2pRemoveEd2kItem(item_id) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.ed2k_items.retain(|i| i.id != item_id);
+                }
+            }
+            Message::P2pClearEd2kItems => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.ed2k_items.clear();
+                    p.ed2k_error = None;
+                }
+            }
+            Message::P2pDownloadSingleEd2k(item_id) => {
+                if let Some(p) = &mut self.p2p_popup
+                    && let Some(idx) = p.ed2k_items.iter().position(|i| i.id == item_id)
+                {
+                    let item = p.ed2k_items.remove(idx);
+                    let save_dir = {
+                        let d = p.save_dir.trim();
+                        if d.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(d))
+                        }
+                    };
+                    let req = NewTaskRequest {
+                        url: item.raw_url,
+                        filename: Some(item.filename.clone()),
+                        save_dir,
+                        max_connections: None,
+                        speed_limit_bps: None,
+                        headers: BTreeMap::new(),
+                        checksum: None,
+                        selected_files: None,
+                        source: TaskSource::Manual,
+                        auto_start: true,
+                    };
+                    self.active_nav = NavSection::All;
+                    self.toast = Some(format!("已开始下载 eD2k 任务: {}", item.filename));
+                    let mgr = Arc::clone(&self.manager);
+                    return Task::perform(
+                        async move { mgr.add_task(req).await.map_err(|e| e.to_string()) },
+                        Message::CaptureStartedWithDialog,
+                    );
+                }
+            }
+            Message::P2pSubmitEd2kSelected(auto_start) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    let chosen: Vec<Ed2kSelectItem> = p
+                        .ed2k_items
+                        .iter()
+                        .filter(|i| i.selected)
+                        .cloned()
+                        .collect();
+                    if chosen.is_empty() {
+                        return Task::none();
+                    }
+                    let count = chosen.len();
+                    let save_dir = {
+                        let d = p.save_dir.trim();
+                        if d.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(d))
+                        }
+                    };
+                    p.ed2k_items.retain(|i| !i.selected);
+                    let close_win = if p.ed2k_items.is_empty() {
+                        self.p2p_popup.take().and_then(|st| st.window_id)
+                    } else {
+                        None
+                    };
+                    self.active_nav = NavSection::All;
+                    self.toast = Some(format!(
+                        "已提交 {count} 个 eD2k 任务（{}）",
+                        if auto_start { "开始下载" } else { "加入暂停队列" }
+                    ));
+                    let mgr = Arc::clone(&self.manager);
+                    let submit = Task::perform(
+                        async move {
+                            let mut last_err = None;
+                            for entry in chosen {
+                                let req = NewTaskRequest {
+                                    url: entry.raw_url,
+                                    filename: Some(entry.filename),
+                                    save_dir: save_dir.clone(),
+                                    max_connections: None,
+                                    speed_limit_bps: None,
+                                    headers: BTreeMap::new(),
+                                    checksum: None,
+                                    selected_files: None,
+                                    source: TaskSource::Manual,
+                                    auto_start,
+                                };
+                                if let Err(e) = mgr.add_task(req).await {
+                                    last_err = Some(e.to_string());
+                                }
+                            }
+                            match last_err {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            }
+                        },
+                        Message::TaskOpFinished,
+                    );
+                    if let Some(wid) = close_win {
+                        return Task::batch([window::close(wid), submit]);
+                    }
+                    return submit;
+                }
+            }
+            Message::P2pSetFilter(f) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.filter = f;
+                }
+            }
+            Message::P2pSearchChanged(v) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.search = v;
+                }
+            }
+            Message::P2pSelectAllVisible(select) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    match p.tab {
+                        P2pSelectTab::Torrent => {
+                            let vis: HashSet<usize> = views::p2p_select_popup::visible_bt_files(p)
+                                .into_iter()
+                                .map(|f| f.index)
+                                .collect();
+                            for f in &mut p.bt_files {
+                                if vis.contains(&f.index) {
+                                    f.selected = select;
+                                }
+                            }
+                        }
+                        P2pSelectTab::Ed2k => {
+                            let vis: HashSet<usize> =
+                                views::p2p_select_popup::visible_ed2k_items(p)
+                                    .into_iter()
+                                    .map(|i| i.id)
+                                    .collect();
+                            for i in &mut p.ed2k_items {
+                                if vis.contains(&i.id) {
+                                    i.selected = select;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Message::P2pInvertSelection => {
+                if let Some(p) = &mut self.p2p_popup {
+                    match p.tab {
+                        P2pSelectTab::Torrent => {
+                            let vis: HashSet<usize> = views::p2p_select_popup::visible_bt_files(p)
+                                .into_iter()
+                                .map(|f| f.index)
+                                .collect();
+                            for f in &mut p.bt_files {
+                                if vis.contains(&f.index) {
+                                    f.selected = !f.selected;
+                                }
+                            }
+                        }
+                        P2pSelectTab::Ed2k => {
+                            let vis: HashSet<usize> =
+                                views::p2p_select_popup::visible_ed2k_items(p)
+                                    .into_iter()
+                                    .map(|i| i.id)
+                                    .collect();
+                            for i in &mut p.ed2k_items {
+                                if vis.contains(&i.id) {
+                                    i.selected = !i.selected;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Message::P2pSaveDirChanged(v) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.save_dir = v;
+                }
+            }
+            Message::P2pBrowseDir => {
+                let start = self
+                    .p2p_popup
+                    .as_ref()
+                    .map(|p| PathBuf::from(&p.save_dir))
+                    .unwrap_or_else(|| self.config.default_save_dir.clone());
+                return Task::perform(
+                    async move {
+                        let mut dlg = rfd::AsyncFileDialog::new();
+                        if start.is_dir() {
+                            dlg = dlg.set_directory(start);
+                        }
+                        dlg.pick_folder().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::P2pDirPicked,
+                );
+            }
+            Message::P2pDirPicked(Some(dir)) => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.save_dir = dir.to_string_lossy().to_string();
+                }
+            }
+            Message::P2pDirPicked(None) => {}
             Message::OpenTaskDetailPopup(task_id) => {
                 return self.open_download_detail_popup(task_id);
             }
@@ -2221,11 +3040,15 @@ impl SiphonApp {
             Message::QuickBarSubmit => {
                 let raw = self.quick_input.trim().to_string();
                 let low = raw.to_ascii_lowercase();
-                if low.starts_with("http://")
-                    || low.starts_with("https://")
-                    || low.starts_with("magnet:?")
-                    || low.starts_with("ed2k://|file|")
-                {
+                if is_bittorrent_url(&raw) {
+                    self.quick_input.clear();
+                    return self.open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(raw));
+                }
+                if is_ed2k_file_link(&raw) {
+                    self.quick_input.clear();
+                    return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(raw));
+                }
+                if low.starts_with("http://") || low.starts_with("https://") {
                     self.quick_input.clear();
                     self.active_nav = NavSection::All;
                     let mgr = Arc::clone(&self.manager);
@@ -2574,6 +3397,7 @@ impl SiphonApp {
                     speed_limit_bps: Some(speed_limit_bps),
                     headers,
                     checksum,
+                    selected_files: None,
                     source: TaskSource::Manual,
                     auto_start,
                 };
@@ -2632,9 +3456,10 @@ impl SiphonApp {
             }
             Message::ModalTorrentFilePicked(Some(path)) => {
                 if let Ok(file_url) = url::Url::from_file_path(&path) {
-                    self.modal.url = file_url.to_string();
-                    self.modal.probe_error = None;
-                    return self.update(Message::ModalProbeUrl);
+                    return self.open_or_update_p2p_popup(
+                        P2pSelectTab::Torrent,
+                        Some(file_url.to_string()),
+                    );
                 }
             }
             Message::ModalTorrentFilePicked(None) => {}
@@ -2681,6 +3506,7 @@ impl SiphonApp {
                                 speed_limit_bps: Some(speed_limit_bps),
                                 headers: BTreeMap::new(),
                                 checksum: None,
+                                selected_files: None,
                                 source: TaskSource::Manual,
                                 auto_start,
                             };
@@ -3893,6 +4719,7 @@ impl SiphonApp {
                     speed_limit_bps: Some(0),
                     headers: BTreeMap::new(),
                     checksum: None,
+                    selected_files: None,
                     source: TaskSource::Manual,
                     auto_start: true,
                 };
@@ -4025,6 +4852,26 @@ impl SiphonApp {
                 .as_ref()
                 .map(|s| s.save_dir.as_str())
                 .unwrap_or(""),
+            InputTarget::P2pSourceInput => self
+                .p2p_popup
+                .as_ref()
+                .map(|p| p.source_input.as_str())
+                .unwrap_or(""),
+            InputTarget::P2pEd2kInput => self
+                .p2p_popup
+                .as_ref()
+                .map(|p| p.ed2k_input.as_str())
+                .unwrap_or(""),
+            InputTarget::P2pSearch => self
+                .p2p_popup
+                .as_ref()
+                .map(|p| p.search.as_str())
+                .unwrap_or(""),
+            InputTarget::P2pSaveDir => self
+                .p2p_popup
+                .as_ref()
+                .map(|p| p.save_dir.as_str())
+                .unwrap_or(""),
         }
     }
 
@@ -4107,6 +4954,28 @@ impl SiphonApp {
                     s.save_dir = val;
                 }
             }
+            InputTarget::P2pSourceInput => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.source_input = val;
+                    p.bt_error = None;
+                }
+            }
+            InputTarget::P2pEd2kInput => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.ed2k_input = val;
+                    p.ed2k_error = None;
+                }
+            }
+            InputTarget::P2pSearch => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.search = val;
+                }
+            }
+            InputTarget::P2pSaveDir => {
+                if let Some(p) = &mut self.p2p_popup {
+                    p.save_dir = val;
+                }
+            }
         }
     }
 
@@ -4114,7 +4983,7 @@ impl SiphonApp {
         let Some(raw) = read_clipboard_text() else {
             return Task::none();
         };
-        let cleaned: String = if target == InputTarget::ModalBatchUrls {
+        let cleaned: String = if matches!(target, InputTarget::ModalBatchUrls | InputTarget::P2pEd2kInput) {
             raw.replace(['\r', '\n'], " ").trim().to_string()
         } else {
             raw.chars()
@@ -4133,6 +5002,8 @@ impl SiphonApp {
                 | InputTarget::ModalUrl
                 | InputTarget::ReplaceUrl
                 | InputTarget::SniffPageUrl
+                | InputTarget::P2pSourceInput
+                | InputTarget::P2pEd2kInput
         );
         let low = cleaned.to_ascii_lowercase();
         let pasted_is_url = low.starts_with("http://")
@@ -4154,6 +5025,8 @@ impl SiphonApp {
                 InputTarget::QuickBar => return self.update(Message::QuickBarSubmit),
                 InputTarget::ModalUrl => return self.update(Message::ModalProbeUrl),
                 InputTarget::SniffPageUrl => return self.update(Message::SniffFetchPageUrl),
+                InputTarget::P2pSourceInput => return self.update(Message::P2pInspectTorrent),
+                InputTarget::P2pEd2kInput => return self.update(Message::P2pParseEd2kInput),
                 _ => {}
             }
         }
@@ -4163,6 +5036,12 @@ impl SiphonApp {
             InputTarget::ModalUrl => operation::focus(views::new_task::modal_url_id()),
             InputTarget::ReplaceUrl => operation::focus(views::inspector::replace_url_id()),
             InputTarget::SniffPageUrl => operation::focus(views::sniff_popup::sniff_page_url_id()),
+            InputTarget::P2pSourceInput => {
+                operation::focus(views::p2p_select_popup::p2p_source_input_id())
+            }
+            InputTarget::P2pEd2kInput => {
+                operation::focus(views::p2p_select_popup::p2p_ed2k_input_id())
+            }
             _ => Task::none(),
         }
     }
@@ -4216,6 +5095,18 @@ impl SiphonApp {
                 "",
                 Some(Message::ContextPasteAndGo(target)),
             ));
+        } else if target == InputTarget::P2pSourceInput {
+            items = items.push(item(
+                "粘贴并解析种子",
+                "",
+                Some(Message::ContextPasteAndGo(target)),
+            ));
+        } else if target == InputTarget::P2pEd2kInput {
+            items = items.push(item(
+                "粘贴并提取 eD2k",
+                "",
+                Some(Message::ContextPasteAndGo(target)),
+            ));
         }
 
         items = items
@@ -4243,6 +5134,14 @@ impl SiphonApp {
             InputTarget::SniffPageUrl | InputTarget::SniffSearch | InputTarget::SniffSaveDir
         ) {
             (780.0f32, 580.0f32)
+        } else if matches!(
+            target,
+            InputTarget::P2pSourceInput
+                | InputTarget::P2pEd2kInput
+                | InputTarget::P2pSearch
+                | InputTarget::P2pSaveDir
+        ) {
+            (820.0f32, 600.0f32)
         } else {
             (self.window_size.width, self.window_size.height)
         };
@@ -4287,8 +5186,22 @@ impl SiphonApp {
         if unique.is_empty() {
             return Task::none();
         }
+        let ed2k_only: Vec<String> = unique
+            .iter()
+            .filter(|u| is_ed2k_file_link(u))
+            .cloned()
+            .collect();
+        if !ed2k_only.is_empty() && ed2k_only.len() == unique.len() {
+            return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(ed2k_only.join("\n")));
+        }
         if unique.len() == 1 {
             let url = unique.remove(0);
+            if is_bittorrent_url(&url) {
+                return self.open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(url));
+            }
+            if is_ed2k_file_link(&url) {
+                return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(url));
+            }
             if self.modal.open {
                 self.modal.url = url;
                 self.modal.probe_error = None;
@@ -4438,6 +5351,27 @@ impl SiphonApp {
                 return stack![sniff_base, menu_layer].into();
             }
             return sniff_base;
+        }
+
+        // Render standalone BitTorrent (.torrent / Magnet) & eD2k Selective Download window
+        if let Some(p2p) = &self.p2p_popup
+            && p2p.window_id == Some(window_id)
+        {
+            let p2p_base =
+                views::p2p_select_popup::view(p2p, self.config.ed2k.verify_md4_hash, palette);
+            if let Some(menu) = self.context_menu
+                && matches!(
+                    menu.target,
+                    InputTarget::P2pSourceInput
+                        | InputTarget::P2pEd2kInput
+                        | InputTarget::P2pSearch
+                        | InputTarget::P2pSaveDir
+                )
+            {
+                let menu_layer = self.view_context_menu(menu, palette);
+                return stack![p2p_base, menu_layer].into();
+            }
+            return p2p_base;
         }
 
         // Render standalone download progress detail window when `window_id` belongs to `download_popups`
@@ -4695,6 +5629,10 @@ impl SiphonApp {
                     | InputTarget::SniffPageUrl
                     | InputTarget::SniffSearch
                     | InputTarget::SniffSaveDir
+                    | InputTarget::P2pSourceInput
+                    | InputTarget::P2pEd2kInput
+                    | InputTarget::P2pSearch
+                    | InputTarget::P2pSaveDir
             )
         {
             let menu_layer = self.view_context_menu(menu, palette);
