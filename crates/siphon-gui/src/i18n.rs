@@ -48,6 +48,9 @@ impl Strings {
     pub fn rules(&self) -> &'static str {
         self.t("规则引擎", "Rules")
     }
+    pub fn scheduler(&self) -> &'static str {
+        self.t("计划调度", "Scheduler")
+    }
     pub fn plugins(&self) -> &'static str {
         self.t("插件扩展", "Plugins")
     }

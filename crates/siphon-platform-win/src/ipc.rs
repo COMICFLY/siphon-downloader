@@ -330,7 +330,8 @@ pub fn spawn_browser_http_bridge(
                         match serde_json::from_str::<BrowserCapturePayload>(json_body) {
                             Ok(payload)
                                 if payload.url.starts_with("http://")
-                                    || payload.url.starts_with("https://") =>
+                                    || payload.url.starts_with("https://")
+                                    || payload.url.to_ascii_lowercase().starts_with("magnet:?") =>
                             {
                                 let _ = tx_conn.send(IpcCommand::BrowserCapture(payload));
                                 ("200 OK", r#"{"ok":true,"captured":true}"#.to_string())

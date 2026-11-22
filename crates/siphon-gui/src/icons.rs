@@ -35,6 +35,8 @@ pub enum IconKind {
     Bolt,
     Info,
     ExternalLink,
+    Clock,
+    Layers,
 }
 
 impl IconKind {
@@ -83,6 +85,8 @@ impl IconKind {
             Self::Bolt => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2.5 4.5 14 12 14 11 21.5 19.5 10 12 10 13 2.5"/></svg>"##,
             Self::Info => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 16v-4"/><circle cx="12" cy="8.5" r="0.6" fill="currentColor"/></svg>"##,
             Self::ExternalLink => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5"/><path d="M10 14L19 5"/><path d="M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/></svg>"##,
+            Self::Clock => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>"##,
+            Self::Layers => br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 3.5 3.5 8 12 12.5 20.5 8 12 3.5"/><polyline points="3.5 12.5 12 17 20.5 12.5"/><polyline points="3.5 16.5 12 21 20.5 16.5"/></svg>"##,
         }
     }
 }

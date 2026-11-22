@@ -1,6 +1,6 @@
 ; Siphon Downloader — Windows Standard Installer Script (Inno Setup 6)
 #define MyAppName "Siphon Downloader"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "COMICFLY"
 #define MyAppURL "https://github.com/COMICFLY/siphon-downloader"
 #define MyAppExeName "siphon.exe"
@@ -30,7 +30,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-CloseApplications=yes
+CloseApplications=force
+RestartApplications=yes
 ChangesEnvironment=no
 
 [Languages]
@@ -61,6 +62,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 Siphon Downloader"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait postinstall skipifnotsilent
 
 [Code]
 var
@@ -93,11 +95,14 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    PointerFile := ExpandConstant('{app}\data_dir.txt');
+    // During silent in-app upgrades, preserve existing custom data_dir.txt if present
+    if WizardSilent and FileExists(PointerFile) then
+      Exit;
     DataDir := Trim(DataDirPage.Values[0]);
     if DataDir <> '' then
     begin
       ForceDirectories(DataDir);
-      PointerFile := ExpandConstant('{app}\data_dir.txt');
       SaveStringToFile(PointerFile, Utf8Encode(DataDir), False);
     end;
   end;

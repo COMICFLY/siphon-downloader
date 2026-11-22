@@ -2,10 +2,13 @@ use crate::icons::{IconKind, icon};
 use crate::state::{Message, UpdateCheckStatus};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette, clean_scrollable_style,
-    hairline_rule_style, outline_btn_style, panel_style, primary_btn_style,
+    hairline_rule_style, outline_btn_style, panel_style, primary_btn_style, progress_style,
 };
-use iced::widget::{button, column, container, image, row, rule, scrollable, space, text};
+use iced::widget::{
+    button, column, container, image, progress_bar, row, rule, scrollable, space, text,
+};
 use iced::{Alignment, Element, Length};
+use siphon_core::{DownloadTask, TaskStatus, format_bytes, format_speed};
 use siphon_engine_http::{GITHUB_RELEASES_URL, GITHUB_REPO_URL, GITHUB_USER_URL};
 use std::path::Path;
 
@@ -15,6 +18,7 @@ pub fn view<'a>(
     app_icon: &'a image::Handle,
     author_avatar: &'a image::Handle,
     update_status: &'a UpdateCheckStatus,
+    auto_update_task: Option<&'a DownloadTask>,
     data_dir: &Path,
     palette: SiphonPalette,
 ) -> Element<'a, Message> {
@@ -76,7 +80,7 @@ pub fn view<'a>(
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            text("纯 Rust 编写的 Windows 11 高性能多线程下载器 · 动态二分借片 · 独立悬浮捕获小窗 · 规则引擎 · 浏览器扩展接管")
+            text("纯 Rust 编写的 Windows 11 高性能多线程下载器 · HTTP 动态二分借片 · HLS 流媒体合并 · BitTorrent / 磁力 · 计划调度与批量队列")
                 .size(13)
                 .font(FONT_REGULAR)
                 .color(palette.text_secondary),
@@ -161,21 +165,38 @@ pub fn view<'a>(
             .align_y(Alignment::Center);
 
             if let Some(installer_url) = &info.installer_url {
-                action_row = action_row.push(
-                    button(
-                        row![
-                            icon(IconKind::Downloading, 13.0, palette.cta_text),
-                            text("使用 Siphon 下载新版本安装包")
+                let updating = auto_update_task.is_some();
+                action_row = action_row
+                    .push(
+                        button(text("仅下载安装包").size(12).font(FONT_REGULAR))
+                            .padding([6, 12])
+                            .style(outline_btn_style(palette))
+                            .on_press_maybe(
+                                (!updating)
+                                    .then_some(Message::DownloadUpdateInstaller(installer_url.clone())),
+                            ),
+                    )
+                    .push(
+                        button(
+                            row![
+                                icon(IconKind::Bolt, 13.0, palette.cta_text),
+                                text(if updating {
+                                    "正在下载更新..."
+                                } else {
+                                    "一键下载并自动安装"
+                                })
                                 .size(12)
                                 .font(FONT_MEDIUM),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                    )
-                    .padding([6, 14])
-                    .style(primary_btn_style(palette))
-                    .on_press(Message::DownloadUpdateInstaller(installer_url.clone())),
-                );
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding([6, 14])
+                        .style(primary_btn_style(palette))
+                        .on_press_maybe(
+                            (!updating).then_some(Message::StartAutoUpdate(installer_url.clone())),
+                        ),
+                    );
             }
 
             let mut update_box = column![
@@ -202,6 +223,53 @@ pub fn view<'a>(
                         .size(12)
                         .font(FONT_REGULAR)
                         .color(palette.text_secondary),
+                );
+            }
+
+            if let Some(task) = auto_update_task {
+                let ratio = task.progress_ratio();
+                let pct = (ratio * 100.0).clamp(0.0, 100.0);
+                let size_txt = match task.total_size {
+                    Some(total) => format!(
+                        "{} / {}",
+                        format_bytes(task.downloaded_bytes),
+                        format_bytes(total)
+                    ),
+                    None => format_bytes(task.downloaded_bytes),
+                };
+                let status_hint = if task.status == TaskStatus::Completed {
+                    "更新包下载完成，正在启动静默安装程序并重启 Siphon...".to_string()
+                } else {
+                    format!(
+                        "正在自动下载更新包 ({pct:.1}%) · {} · 下载完成后将自动静默升级并重启",
+                        format_speed(task.speed_bps)
+                    )
+                };
+                update_box = update_box.push(
+                    container(
+                        column![
+                            row![
+                                text(status_hint)
+                                    .size(12)
+                                    .font(FONT_MEDIUM)
+                                    .color(palette.text_primary),
+                                space::horizontal(),
+                                text(size_txt)
+                                    .size(12)
+                                    .font(FONT_MONO)
+                                    .color(palette.text_secondary),
+                            ]
+                            .align_y(Alignment::Center),
+                            progress_bar(0.0..=1.0, ratio)
+                                .length(Length::Fill)
+                                .girth(Length::Fixed(6.0))
+                                .style(progress_style(palette, palette.accent)),
+                        ]
+                        .spacing(8),
+                    )
+                    .padding([10, 12])
+                    .width(Length::Fill)
+                    .style(panel_style(palette.bg_input, Some(palette.hairline), 8.0)),
                 );
             }
 

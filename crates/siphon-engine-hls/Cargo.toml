@@ -1,0 +1,24 @@
+[package]
+name = "siphon-engine-hls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+siphon-core.workspace = true
+siphon-engine-http.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+url.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+hex.workspace = true
+aes = "0.8"
+cbc = { version = "0.1", features = ["block-padding"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true

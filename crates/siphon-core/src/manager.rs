@@ -209,6 +209,23 @@ impl DownloadManager {
             .ok_or_else(|| SiphonError::UnsupportedProtocol(url.to_string()))
     }
 
+    fn normalize_input_url(raw: &str) -> Result<(String, Url)> {
+        let trimmed = raw.trim().trim_matches('"');
+        if let Ok(u) = Url::parse(trimmed) {
+            return Ok((trimmed.to_string(), u));
+        }
+        // Allow local `.torrent` file paths cleanly by turning them into `file://` URLs
+        let p = Path::new(trimmed);
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+            && let Ok(u) = Url::from_file_path(p)
+        {
+            return Ok((u.to_string(), u));
+        }
+        Err(SiphonError::InvalidUrl(trimmed.to_string()))
+    }
+
     /// Run plugins + protocol probe + rule engine preview without creating a task.
     pub async fn probe_url(
         &self,
@@ -216,14 +233,13 @@ impl DownloadManager {
         headers: &BTreeMap<String, String>,
         source: TaskSource,
     ) -> Result<ProbePreview> {
-        let cleaned = raw_url.trim();
-        let _ = Url::parse(cleaned).map_err(|_| SiphonError::InvalidUrl(cleaned.to_string()))?;
+        let (cleaned, _) = Self::normalize_input_url(raw_url)?;
 
         let resolved = {
             let plugins = self.plugins.read().await;
             plugins
                 .run_resolve(&ResolveInput {
-                    url: cleaned.to_string(),
+                    url: cleaned,
                     headers: headers.clone(),
                 })
                 .await
@@ -307,9 +323,7 @@ impl DownloadManager {
         req: NewTaskRequest,
         run_resolve_plugins: bool,
     ) -> Result<(DownloadTask, Vec<crate::plugin::ExtraTaskSpec>, bool)> {
-        let cleaned_url = req.url.trim().to_string();
-        let parsed =
-            Url::parse(&cleaned_url).map_err(|_| SiphonError::InvalidUrl(cleaned_url.clone()))?;
+        let (cleaned_url, parsed) = Self::normalize_input_url(&req.url)?;
 
         let resolved = if run_resolve_plugins {
             let plugins = self.plugins.read().await;
@@ -886,10 +900,47 @@ impl DownloadManager {
 }
 
 pub fn infer_filename_from_url(url: &Url) -> String {
+    if url.scheme().eq_ignore_ascii_case("magnet") {
+        let mut dn = None;
+        let mut hash = None;
+        for (k, v) in url.query_pairs() {
+            if k == "dn" && !v.trim().is_empty() {
+                dn = Some(v.trim().to_string());
+            } else if k == "xt"
+                && let Some(h) = v.rsplit(':').next()
+                && !h.is_empty()
+            {
+                hash = Some(h.to_string());
+            }
+        }
+        if let Some(name) = dn {
+            return name;
+        }
+        if let Some(h) = hash {
+            return format!("torrent_{}", &h[..h.len().min(12)]);
+        }
+        return format!("magnet_{}", Utc::now().format("%Y%m%d_%H%M%S"));
+    }
+
     if let Some(mut segs) = url.path_segments()
         && let Some(last) = segs.next_back()
         && !last.is_empty()
     {
+        if last.to_ascii_lowercase().ends_with(".m3u8") {
+            let stem = last.trim_end_matches(|c| c == '8' || c == 'u' || c == '3' || c == 'm' || c == 'M' || c == 'U' || c == '.');
+            let base = if stem.is_empty() || stem.eq_ignore_ascii_case("index") || stem.eq_ignore_ascii_case("playlist") {
+                format!("stream_{}", Utc::now().format("%Y%m%d_%H%M%S"))
+            } else {
+                stem.to_string()
+            };
+            return format!("{base}.ts");
+        }
+        if last.to_ascii_lowercase().ends_with(".torrent") {
+            return last
+                .trim_end_matches(".torrent")
+                .trim_end_matches(".TORRENT")
+                .to_string();
+        }
         return last.to_string();
     }
     let host = url.host_str().unwrap_or("download");

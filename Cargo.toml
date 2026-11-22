@@ -3,19 +3,23 @@ resolver = "3"
 members = [
     "crates/siphon-core",
     "crates/siphon-engine-http",
+    "crates/siphon-engine-hls",
+    "crates/siphon-engine-bt",
     "crates/siphon-platform-win",
     "crates/siphon-gui",
     "crates/siphon-native-host",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
 siphon-core = { path = "crates/siphon-core" }
 siphon-engine-http = { path = "crates/siphon-engine-http" }
+siphon-engine-hls = { path = "crates/siphon-engine-hls" }
+siphon-engine-bt = { path = "crates/siphon-engine-bt" }
 siphon-platform-win = { path = "crates/siphon-platform-win" }
 
 tokio = { version = "1.54", features = ["full"] }

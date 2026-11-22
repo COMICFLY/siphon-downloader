@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod config;
 pub mod error;
 pub mod limiter;
@@ -8,7 +9,11 @@ pub mod protocol;
 pub mod rules;
 pub mod storage;
 
-pub use config::{AppConfig, Language, ListDensity, ThemeMode};
+pub use batch::{BatchExpandResult, MAX_BATCH_URLS, expand_batch_input};
+pub use config::{
+    AppConfig, Language, ListDensity, QueueCompleteAction, ScheduleConfig, ThemeMode,
+    is_time_in_window, parse_hhmm,
+};
 pub use error::{Result, SiphonError};
 pub use limiter::{HierarchicalLimiter, TokenBucket};
 pub use manager::{DownloadManager, deduplicate_filename, infer_filename_from_url, sanitize_filename};

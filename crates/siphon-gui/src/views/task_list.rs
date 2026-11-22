@@ -9,7 +9,8 @@ use crate::theme::{
 use iced::widget::{button, column, container, image, progress_bar, row, scrollable, space, text};
 use iced::{Alignment, Color, Element, Length};
 use siphon_core::{
-    DownloadTask, ListDensity, TaskId, TaskStatus, format_bytes, format_eta, format_speed,
+    DownloadTask, ListDensity, ProtocolKind, TaskId, TaskStatus, format_bytes, format_eta,
+    format_speed,
 };
 use siphon_platform_win::FileIconKey;
 use std::collections::HashMap;
@@ -424,26 +425,51 @@ fn task_row<'a>(
         .height(Length::Fixed(6.0))
         .style(panel_style(status_color, None, 3.0));
 
-    let mut meta_row = row![
-        status_dot,
-        text(strings.status_label(task.status))
-            .size(12)
-            .font(FONT_REGULAR)
-            .wrapping(text::Wrapping::None)
-            .color(palette.text_secondary),
-        text("·")
-            .size(12)
-            .wrapping(text::Wrapping::None)
-            .color(palette.text_muted),
-        text(size_summary)
-            .size(12)
-            .font(FONT_MONO)
-            .wrapping(text::Wrapping::None)
-            .color(palette.text_secondary),
-    ]
-    .spacing(6)
-    .width(Length::Fill)
-    .align_y(Alignment::Center);
+    let mut meta_row = row![status_dot]
+        .spacing(6)
+        .width(Length::Fill)
+        .align_y(Alignment::Center);
+
+    if matches!(task.protocol, ProtocolKind::Hls | ProtocolKind::BitTorrent) {
+        let (badge_txt, badge_fg, badge_bg) = match task.protocol {
+            ProtocolKind::Hls => ("HLS", palette.ok, palette.ok_soft),
+            ProtocolKind::BitTorrent => ("BT", palette.warn, palette.warn_soft),
+            _ => unreachable!(),
+        };
+        meta_row = meta_row.push(
+            container(
+                text(badge_txt)
+                    .size(10)
+                    .font(FONT_MONO_BOLD)
+                    .wrapping(text::Wrapping::None)
+                    .color(badge_fg),
+            )
+            .padding([1, 5])
+            .style(panel_style(badge_bg, None, 4.0)),
+        );
+    }
+
+    meta_row = meta_row
+        .push(
+            text(strings.status_label(task.status))
+                .size(12)
+                .font(FONT_REGULAR)
+                .wrapping(text::Wrapping::None)
+                .color(palette.text_secondary),
+        )
+        .push(
+            text("·")
+                .size(12)
+                .wrapping(text::Wrapping::None)
+                .color(palette.text_muted),
+        )
+        .push(
+            text(size_summary)
+                .size(12)
+                .font(FONT_MONO)
+                .wrapping(text::Wrapping::None)
+                .color(palette.text_secondary),
+        );
 
     if task.status == TaskStatus::Downloading {
         meta_row = meta_row

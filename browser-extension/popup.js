@@ -61,7 +61,7 @@ function loadPageResources() {
       title.title = item.url;
 
       const tag = document.createElement("span");
-      tag.className = "res-tag";
+      tag.className = `res-tag ${item.kind || ""}`;
       tag.textContent = item.kind;
       title.appendChild(tag);
       title.appendChild(document.createTextNode(shortName(item.url, item.label)));
@@ -89,7 +89,10 @@ function loadPageResources() {
 
 sendBtn.addEventListener("click", async () => {
   const url = urlInput.value.trim();
-  if (!url.startsWith("http://") && !url.startsWith("https://")) return;
+  const low = url.toLowerCase();
+  if (!low.startsWith("http://") && !low.startsWith("https://") && !low.startsWith("magnet:?")) {
+    return;
+  }
   chrome.runtime.sendMessage(
     { type: "SUBMIT_TO_SIPHON", url, referrer: "", silent: false },
     () => {

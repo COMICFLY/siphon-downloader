@@ -19,19 +19,23 @@ use iced::widget::{
 use iced::{Alignment, Element, Event, Length, Point, Size, Subscription, Task, Theme, stream, window};
 use siphon_core::{
     AppConfig, AutomationRule, ChecksumSpec, DownloadManager, DownloadTask, ExternalPlugin,
-    FileCategory, HashAlgorithm, NewTaskRequest, RuleAction, RuleCondition, RuleEngine,
-    RuleEvalInput, TaskEvent, TaskId, TaskSource, TaskStatus, ThemeMode, format_speed,
-    infer_filename_from_url, sanitize_filename,
+    FileCategory, HashAlgorithm, NewTaskRequest, QueueCompleteAction, RuleAction, RuleCondition,
+    RuleEngine, RuleEvalInput, TaskEvent, TaskId, TaskSource, TaskStatus, ThemeMode,
+    expand_batch_input, format_speed, infer_filename_from_url, is_time_in_window, parse_hhmm,
+    sanitize_filename,
 };
+use siphon_engine_bt::BitTorrentEngine;
+use siphon_engine_hls::HlsEngine;
 use siphon_engine_http::{HttpEngine, check_for_updates};
 use siphon_platform_win::{
     BrowserCapturePayload, DropEvent, FileIconKey, IpcCommand, TrayAction, TrayController,
     WinHookEvent, apply_win11_backdrop, deploy_browser_extension, detect_installed_browsers,
-    export_browser_extension_zip, extract_file_icons_async, extract_urls_from_text,
-    install_url_drop_target, install_window_hooks, is_autostart_enabled, is_system_dark_mode,
-    launch_browser_extensions_page, open_file, open_folder, open_url, read_clipboard_text,
-    reveal_in_explorer, set_autostart, show_window_native, spawn_browser_http_bridge,
-    spawn_clipboard_monitor, spawn_ipc_server, spawn_system_tray, write_clipboard_text,
+    execute_power_action, export_browser_extension_zip, extract_file_icons_async,
+    extract_urls_from_text, install_url_drop_target, install_window_hooks, is_autostart_enabled,
+    is_system_dark_mode, launch_browser_extensions_page, launch_silent_installer_update, open_file,
+    open_folder, open_url, read_clipboard_text, reveal_in_explorer, set_autostart,
+    show_window_native, spawn_browser_http_bridge, spawn_clipboard_monitor, spawn_ipc_server,
+    spawn_system_tray, write_clipboard_text,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,7 +81,11 @@ pub fn init_shared_runtime() -> Arc<DownloadManager> {
 
         let manager = DownloadManager::new(
             data_dir,
-            vec![Arc::new(HttpEngine::new())],
+            vec![
+                Arc::new(HlsEngine::new()),
+                Arc::new(BitTorrentEngine::new()),
+                Arc::new(HttpEngine::new()),
+            ],
             extra_plugins,
         )
         .expect("Failed to initialize Siphon DownloadManager");
@@ -152,11 +160,18 @@ pub struct SiphonApp {
     ext_install_modal: Option<ExtInstallModalState>,
     browser_ext_connected: bool,
     update_status: UpdateCheckStatus,
+    auto_update_task_id: Option<TaskId>,
     app_icon_handle: image::Handle,
     author_avatar_handle: image::Handle,
     capture_popup: Option<CapturePopupState>,
     download_popups: HashMap<window::Id, DownloadPopupState>,
     rule_draft: RuleDraft,
+
+    // Scheduler runtime state
+    sched_speed_kbps_input: String,
+    sched_last_start_day: Option<(i32, u32, u32)>,
+    sched_last_stop_day: Option<(i32, u32, u32)>,
+    sched_speed_window_active: bool,
 
     // Settings text input buffers
     save_dir_input: String,
@@ -202,6 +217,7 @@ impl SiphonApp {
         let ua_input = config.user_agent.clone();
         let accent_hex_input = config.accent_color.clone();
         let popup_accent_hex_input = config.download_popup_accent.clone();
+        let sched_speed_kbps_input = config.schedule.scheduled_speed_limit_kbps.to_string();
 
         let (rgba, w, h) = siphon_platform_win::generate_siphon_icon_rgba();
         let app_icon_handle = image::Handle::from_rgba(w, h, rgba.clone());
@@ -277,6 +293,7 @@ impl SiphonApp {
             ext_install_modal: None,
             browser_ext_connected: false,
             update_status: UpdateCheckStatus::Idle,
+            auto_update_task_id: None,
             app_icon_handle,
             author_avatar_handle,
             capture_popup: None,
@@ -285,6 +302,10 @@ impl SiphonApp {
                 save_dir_template: r"{base}\{domain}".to_string(),
                 ..Default::default()
             },
+            sched_speed_kbps_input,
+            sched_last_start_day: None,
+            sched_last_stop_day: None,
+            sched_speed_window_active: false,
             save_dir_input,
             global_speed_input,
             proxy_input,
@@ -814,11 +835,19 @@ impl SiphonApp {
                 }
             }
             Message::FileDropped(path) => {
+                if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+                    && let Ok(file_url) = url::Url::from_file_path(&path)
+                {
+                    return self.update(Message::OpenNewTaskModal(Some(file_url.to_string())));
+                }
                 if let Some(url) = extract_url_from_dropped_file(&path) {
                     return self.update(Message::OpenNewTaskModal(Some(url)));
                 } else {
                     self.toast = Some(format!(
-                        "未在拖入文件 {} 中检测到 HTTP/HTTPS 链接",
+                        "未在拖入文件 {} 中检测到 HTTP/HTTPS/Magnet 链接或 .torrent 种子",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
                 }
@@ -880,8 +909,16 @@ impl SiphonApp {
                         | InputTarget::ModalFilename
                         | InputTarget::ModalSaveDir
                         | InputTarget::ModalSpeedLimit
-                        | InputTarget::ModalSha256 => self.active_input,
-                        _ => InputTarget::ModalUrl,
+                        | InputTarget::ModalSha256
+                        | InputTarget::ModalBatchUrls
+                        | InputTarget::ModalBatchFilter => self.active_input,
+                        _ => {
+                            if self.modal.batch_mode {
+                                InputTarget::ModalBatchUrls
+                            } else {
+                                InputTarget::ModalUrl
+                            }
+                        }
                     }
                 } else {
                     self.active_input
@@ -969,6 +1006,19 @@ impl SiphonApp {
                     filename,
                     target_path,
                 } => {
+                    // Check 1: In-app 1-click auto-update installer finished -> launch silent upgrade & exit!
+                    if self.auto_update_task_id == Some(task_id) {
+                        self.auto_update_task_id = None;
+                        match launch_silent_installer_update(&target_path) {
+                            Ok(()) => {
+                                return iced::exit();
+                            }
+                            Err(e) => {
+                                self.toast = Some(format!("启动自动更新安装程序失败: {e}"));
+                            }
+                        }
+                    }
+
                     self.toast = Some(format!("下载完成: {filename}"));
                     let key = FileIconKey::for_task(&filename, &target_path, true);
                     let icon_task = self.load_completed_file_icon_with_retries(key);
@@ -978,17 +1028,52 @@ impl SiphonApp {
                         .filter(|p| p.task_id == task_id && p.auto_close_on_complete)
                         .map(|p| p.window_id)
                         .collect();
-                    if auto_close_ids.is_empty() {
-                        return icon_task;
-                    }
                     let mut batch = vec![icon_task];
                     for wid in auto_close_ids {
                         self.download_popups.remove(&wid);
                         batch.push(window::close(wid));
                     }
+
+                    // Check 2: Queue-complete action when all remaining active/queued tasks are finished
+                    let action = self.config.schedule.on_queue_complete;
+                    if action != QueueCompleteAction::None {
+                        let any_remaining = self.tasks.iter().any(|t| {
+                            t.id != task_id
+                                && (t.status.is_active() || t.status == TaskStatus::Queued)
+                        });
+                        if !any_remaining {
+                            let script = self.config.schedule.post_queue_script.clone();
+                            if self.config.schedule.one_shot_complete_action {
+                                self.config.schedule.on_queue_complete = QueueCompleteAction::None;
+                                let _ = self.config.save(self.manager.data_dir());
+                                batch.push(self.save_config_async());
+                            }
+                            if action == QueueCompleteAction::ExitApp {
+                                return iced::exit();
+                            }
+                            match execute_power_action(action, &script) {
+                                Ok(()) => {
+                                    let desc = match action {
+                                        QueueCompleteAction::Sleep => "系统睡眠",
+                                        QueueCompleteAction::Hibernate => "系统休眠",
+                                        QueueCompleteAction::Shutdown => "30 秒后关机",
+                                        QueueCompleteAction::RunScript => "自定义脚本",
+                                        _ => "完成动作",
+                                    };
+                                    self.toast = Some(format!("全部任务已完成，已触发：{desc}"));
+                                }
+                                Err(e) => {
+                                    self.toast = Some(format!("执行完成后动作失败: {e}"));
+                                }
+                            }
+                        }
+                    }
                     return Task::batch(batch);
                 }
-                TaskEvent::TaskFailed { error, .. } => {
+                TaskEvent::TaskFailed { task_id, error, .. } => {
+                    if self.auto_update_task_id == Some(task_id) {
+                        self.auto_update_task_id = None;
+                    }
                     self.toast = Some(format!("下载中断: {error}"));
                 }
                 TaskEvent::TaskRemoved(id) => {
@@ -1186,6 +1271,15 @@ impl SiphonApp {
                     self.drag_hovering = false;
                     let mut urls = Vec::new();
                     for path in &paths {
+                        if path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+                            && let Ok(file_url) = url::Url::from_file_path(path)
+                        {
+                            urls.push(file_url.to_string());
+                            continue;
+                        }
                         if let Ok(raw) = std::fs::read_to_string(path) {
                             if let Some(u) = extract_url_from_dropped_file(path) {
                                 urls.push(u);
@@ -1195,7 +1289,8 @@ impl SiphonApp {
                         }
                     }
                     if urls.is_empty() {
-                        self.toast = Some("未在拖入文件中检测到有效的 HTTP/HTTPS 链接".to_string());
+                        self.toast =
+                            Some("未在拖入文件中检测到有效的 HTTP/HTTPS/Magnet 链接或 .torrent 种子".to_string());
                     } else {
                         return self.handle_dropped_urls(urls);
                     }
@@ -1474,7 +1569,11 @@ impl SiphonApp {
             }
             Message::QuickBarSubmit => {
                 let raw = self.quick_input.trim().to_string();
-                if raw.starts_with("http://") || raw.starts_with("https://") {
+                let low = raw.to_ascii_lowercase();
+                if low.starts_with("http://")
+                    || low.starts_with("https://")
+                    || low.starts_with("magnet:?")
+                {
                     self.quick_input.clear();
                     self.active_nav = NavSection::All;
                     let mgr = Arc::clone(&self.manager);
@@ -1679,7 +1778,10 @@ impl SiphonApp {
             Message::OpenNewTaskModal(prefill_url) => {
                 self.modal = NewTaskModalState {
                     open: true,
+                    batch_mode: false,
                     url: prefill_url.clone().unwrap_or_default(),
+                    batch_text: String::new(),
+                    batch_filter: String::new(),
                     filename: String::new(),
                     save_dir: self.config.default_save_dir.to_string_lossy().to_string(),
                     connections: self.config.default_connections,
@@ -1831,6 +1933,243 @@ impl SiphonApp {
                     async move { mgr.add_task(req).await.map(|_| ()).map_err(|e| e.to_string()) },
                     Message::TaskOpFinished,
                 );
+            }
+            Message::ModalToggleBatchMode(batch) => {
+                self.modal.batch_mode = batch;
+                if batch {
+                    self.active_input = InputTarget::ModalBatchUrls;
+                    return operation::focus(views::new_task::modal_batch_id());
+                } else {
+                    self.active_input = InputTarget::ModalUrl;
+                    return operation::focus(views::new_task::modal_url_id());
+                }
+            }
+            Message::ModalBatchTextChanged(v) => {
+                self.modal.batch_text = v;
+            }
+            Message::ModalBatchFilterChanged(v) => {
+                self.modal.batch_filter = v;
+            }
+            Message::ModalBatchPasteClipboard => {
+                if let Some(raw) = read_clipboard_text() {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        if self.modal.batch_text.trim().is_empty() {
+                            self.modal.batch_text = trimmed.to_string();
+                        } else {
+                            self.modal.batch_text.push(' ');
+                            self.modal.batch_text.push_str(trimmed);
+                        }
+                    }
+                }
+            }
+            Message::ModalPickTorrentFile => {
+                let start = PathBuf::from(&self.modal.save_dir);
+                return Task::perform(
+                    async move {
+                        let mut dlg = rfd::AsyncFileDialog::new()
+                            .set_title("选择 BitTorrent 种子文件 (.torrent)")
+                            .add_filter("BitTorrent 种子文件", &["torrent"]);
+                        if start.is_dir() {
+                            dlg = dlg.set_directory(start);
+                        }
+                        dlg.pick_file().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::ModalTorrentFilePicked,
+                );
+            }
+            Message::ModalTorrentFilePicked(Some(path)) => {
+                if let Ok(file_url) = url::Url::from_file_path(&path) {
+                    self.modal.url = file_url.to_string();
+                    self.modal.probe_error = None;
+                    return self.update(Message::ModalProbeUrl);
+                }
+            }
+            Message::ModalTorrentFilePicked(None) => {}
+            Message::ModalBatchSubmit(auto_start) => {
+                let expanded = expand_batch_input(&self.modal.batch_text, &self.modal.batch_filter);
+                if expanded.urls.is_empty() {
+                    return Task::none();
+                }
+                let count = expanded.urls.len();
+                let save_dir = {
+                    let d = self.modal.save_dir.trim();
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(d))
+                    }
+                };
+                let connections = self.modal.connections;
+                let speed_limit_bps = self
+                    .modal
+                    .speed_limit_kbps
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+                    .saturating_mul(1024);
+
+                self.modal.open = false;
+                self.active_nav = NavSection::All;
+                self.toast = Some(format!(
+                    "已批量导入 {count} 个任务（{}）",
+                    if auto_start { "自动排队下载" } else { "暂停队列" }
+                ));
+                let mgr = Arc::clone(&self.manager);
+                let urls = expanded.urls;
+                return Task::perform(
+                    async move {
+                        let mut last_err = None;
+                        for url in urls {
+                            let req = NewTaskRequest {
+                                url,
+                                filename: None,
+                                save_dir: save_dir.clone(),
+                                max_connections: Some(connections),
+                                speed_limit_bps: Some(speed_limit_bps),
+                                headers: BTreeMap::new(),
+                                checksum: None,
+                                source: TaskSource::Manual,
+                                auto_start,
+                            };
+                            if let Err(e) = mgr.add_task(req).await {
+                                last_err = Some(e.to_string());
+                            }
+                        }
+                        match last_err {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        }
+                    },
+                    Message::TaskOpFinished,
+                );
+            }
+
+            // Scheduler & Queue Complete Actions
+            Message::SchedToggleStart(v) => {
+                self.config.schedule.start_enabled = v;
+                return self.save_config_async();
+            }
+            Message::SchedStartTimeChanged(v) => {
+                self.config.schedule.start_time = v;
+            }
+            Message::SchedToggleStop(v) => {
+                self.config.schedule.stop_enabled = v;
+                return self.save_config_async();
+            }
+            Message::SchedStopTimeChanged(v) => {
+                self.config.schedule.stop_time = v;
+            }
+            Message::SchedToggleSpeed(v) => {
+                self.config.schedule.speed_schedule_enabled = v;
+                let save = self.save_config_async();
+                let tick = self.update(Message::SchedulerTick);
+                return Task::batch([save, tick]);
+            }
+            Message::SchedSpeedStartChanged(v) => {
+                self.config.schedule.speed_start_time = v;
+            }
+            Message::SchedSpeedEndChanged(v) => {
+                self.config.schedule.speed_end_time = v;
+            }
+            Message::SchedSpeedKbpsChanged(v) => {
+                self.sched_speed_kbps_input = v.clone();
+                self.config.schedule.scheduled_speed_limit_kbps =
+                    v.trim().parse::<u64>().unwrap_or(0);
+            }
+            Message::SchedSetCompleteAction(act) => {
+                self.config.schedule.on_queue_complete = act;
+                return self.save_config_async();
+            }
+            Message::SchedScriptChanged(v) => {
+                self.config.schedule.post_queue_script = v;
+            }
+            Message::SchedToggleOneShot(v) => {
+                self.config.schedule.one_shot_complete_action = v;
+                return self.save_config_async();
+            }
+            Message::SchedSave => {
+                self.config.schedule.scheduled_speed_limit_kbps = self
+                    .sched_speed_kbps_input
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                self.toast = Some("计划调度与完成动作已保存".to_string());
+                let save = self.save_config_async();
+                let tick = self.update(Message::SchedulerTick);
+                return Task::batch([save, tick]);
+            }
+            Message::SchedulerTick => {
+                use chrono::{Datelike, Timelike};
+                let now = chrono::Local::now();
+                let today = (now.year(), now.month(), now.day());
+                let now_mins = (now.hour() * 60 + now.minute()) as u16;
+                let mut tasks_to_run: Vec<Task<Message>> = Vec::new();
+
+                if self.config.schedule.start_enabled
+                    && parse_hhmm(&self.config.schedule.start_time) == Some(now_mins)
+                    && self.sched_last_start_day != Some(today)
+                {
+                    self.sched_last_start_day = Some(today);
+                    self.toast = Some(format!(
+                        "定时任务触发（{}）：已自动开始下载队列",
+                        self.config.schedule.start_time
+                    ));
+                    tasks_to_run.push(self.update(Message::ResumeAll));
+                }
+
+                if self.config.schedule.stop_enabled
+                    && parse_hhmm(&self.config.schedule.stop_time) == Some(now_mins)
+                    && self.sched_last_stop_day != Some(today)
+                {
+                    self.sched_last_stop_day = Some(today);
+                    self.toast = Some(format!(
+                        "定时任务触发（{}）：已自动暂停全部任务",
+                        self.config.schedule.stop_time
+                    ));
+                    tasks_to_run.push(self.update(Message::PauseAll));
+                }
+
+                let should_cap = self.config.schedule.speed_schedule_enabled
+                    && is_time_in_window(
+                        now_mins,
+                        &self.config.schedule.speed_start_time,
+                        &self.config.schedule.speed_end_time,
+                    );
+
+                if should_cap && !self.sched_speed_window_active {
+                    self.sched_speed_window_active = true;
+                    let bps = self
+                        .config
+                        .schedule
+                        .scheduled_speed_limit_kbps
+                        .saturating_mul(1024);
+                    let mgr = Arc::clone(&self.manager);
+                    tasks_to_run.push(Task::perform(
+                        async move {
+                            mgr.update_global_speed_limit(bps)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::TaskOpFinished,
+                    ));
+                } else if !should_cap && self.sched_speed_window_active {
+                    self.sched_speed_window_active = false;
+                    let normal_bps = self.config.global_speed_limit_bps;
+                    let mgr = Arc::clone(&self.manager);
+                    tasks_to_run.push(Task::perform(
+                        async move {
+                            mgr.update_global_speed_limit(normal_bps)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::TaskOpFinished,
+                    ));
+                }
+
+                if !tasks_to_run.is_empty() {
+                    return Task::batch(tasks_to_run);
+                }
             }
 
             // Rules workspace
@@ -2454,6 +2793,39 @@ impl SiphonApp {
                     Message::CaptureStartedWithDialog,
                 );
             }
+            Message::StartAutoUpdate(url) => {
+                let update_dir = std::env::temp_dir().join("SiphonUpdate");
+                let _ = std::fs::create_dir_all(&update_dir);
+                let mgr = Arc::clone(&self.manager);
+                let req = NewTaskRequest {
+                    url,
+                    filename: None,
+                    save_dir: Some(update_dir),
+                    max_connections: Some(8),
+                    speed_limit_bps: Some(0),
+                    headers: BTreeMap::new(),
+                    checksum: None,
+                    source: TaskSource::Manual,
+                    auto_start: true,
+                };
+                self.toast = Some("开始下载更新安装包，完成后将自动启动静默升级...".to_string());
+                return Task::perform(
+                    async move { mgr.add_task(req).await.map_err(|e| e.to_string()) },
+                    Message::AutoUpdateTaskStarted,
+                );
+            }
+            Message::AutoUpdateTaskStarted(res) => match res {
+                Ok(task) => {
+                    let task_id = task.id;
+                    self.auto_update_task_id = Some(task_id);
+                    self.tasks.retain(|t| t.id != task_id);
+                    self.tasks.insert(0, task);
+                }
+                Err(e) => {
+                    self.auto_update_task_id = None;
+                    self.toast = Some(format!("下载更新包失败: {e}"));
+                }
+            },
             Message::SaveSettings => {
                 if !self.save_dir_input.trim().is_empty() {
                     self.config.default_save_dir = PathBuf::from(self.save_dir_input.trim());
@@ -2504,6 +2876,8 @@ impl SiphonApp {
             InputTarget::ModalSaveDir => &self.modal.save_dir,
             InputTarget::ModalSpeedLimit => &self.modal.speed_limit_kbps,
             InputTarget::ModalSha256 => &self.modal.sha256,
+            InputTarget::ModalBatchUrls => &self.modal.batch_text,
+            InputTarget::ModalBatchFilter => &self.modal.batch_filter,
             InputTarget::ReplaceUrl => &self.replace_url_input,
             InputTarget::RuleName => &self.rule_draft.name,
             InputTarget::RuleExtensions => &self.rule_draft.extensions,
@@ -2517,6 +2891,12 @@ impl SiphonApp {
             InputTarget::SettingsUserAgent => &self.ua_input,
             InputTarget::SettingsAccentHex => &self.accent_hex_input,
             InputTarget::SettingsPopupAccentHex => &self.popup_accent_hex_input,
+            InputTarget::SchedStartTime => &self.config.schedule.start_time,
+            InputTarget::SchedStopTime => &self.config.schedule.stop_time,
+            InputTarget::SchedSpeedStart => &self.config.schedule.speed_start_time,
+            InputTarget::SchedSpeedEnd => &self.config.schedule.speed_end_time,
+            InputTarget::SchedSpeedKbps => &self.sched_speed_kbps_input,
+            InputTarget::SchedScript => &self.config.schedule.post_queue_script,
             InputTarget::CaptureFilename => self
                 .capture_popup
                 .as_ref()
@@ -2541,6 +2921,8 @@ impl SiphonApp {
             InputTarget::ModalSaveDir => self.modal.save_dir = val,
             InputTarget::ModalSpeedLimit => self.modal.speed_limit_kbps = val,
             InputTarget::ModalSha256 => self.modal.sha256 = val,
+            InputTarget::ModalBatchUrls => self.modal.batch_text = val,
+            InputTarget::ModalBatchFilter => self.modal.batch_filter = val,
             InputTarget::ReplaceUrl => self.replace_url_input = val,
             InputTarget::RuleName => self.rule_draft.name = val,
             InputTarget::RuleExtensions => self.rule_draft.extensions = val,
@@ -2554,6 +2936,16 @@ impl SiphonApp {
             InputTarget::SettingsUserAgent => self.ua_input = val,
             InputTarget::SettingsAccentHex => self.accent_hex_input = val,
             InputTarget::SettingsPopupAccentHex => self.popup_accent_hex_input = val,
+            InputTarget::SchedStartTime => self.config.schedule.start_time = val,
+            InputTarget::SchedStopTime => self.config.schedule.stop_time = val,
+            InputTarget::SchedSpeedStart => self.config.schedule.speed_start_time = val,
+            InputTarget::SchedSpeedEnd => self.config.schedule.speed_end_time = val,
+            InputTarget::SchedSpeedKbps => {
+                self.config.schedule.scheduled_speed_limit_kbps =
+                    val.trim().parse::<u64>().unwrap_or(0);
+                self.sched_speed_kbps_input = val;
+            }
+            InputTarget::SchedScript => self.config.schedule.post_queue_script = val,
             InputTarget::CaptureFilename => {
                 if let Some(popup) = &mut self.capture_popup {
                     popup.filename = val;
@@ -2573,12 +2965,15 @@ impl SiphonApp {
         let Some(raw) = read_clipboard_text() else {
             return Task::none();
         };
-        let cleaned: String = raw
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let cleaned: String = if target == InputTarget::ModalBatchUrls {
+            raw.replace(['\r', '\n'], " ").trim().to_string()
+        } else {
+            raw.chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
         if cleaned.is_empty() {
             return Task::none();
         }
@@ -2587,8 +2982,9 @@ impl SiphonApp {
             target,
             InputTarget::QuickBar | InputTarget::ModalUrl | InputTarget::ReplaceUrl
         );
+        let low = cleaned.to_ascii_lowercase();
         let pasted_is_url =
-            cleaned.starts_with("http://") || cleaned.starts_with("https://");
+            low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?");
 
         let current = self.get_input_value(target).to_string();
         let next_val = if current.is_empty() || (is_url_box && pasted_is_url) {
@@ -2890,6 +3286,12 @@ impl SiphonApp {
         );
 
         let center_and_inspector: Element<'_, Message> = match self.active_nav {
+            NavSection::Scheduler => views::scheduler_view::view(
+                &self.config.schedule,
+                &self.sched_speed_kbps_input,
+                self.sched_speed_window_active,
+                palette,
+            ),
             NavSection::Rules => views::rules_view::view(&self.rules, &self.rule_draft, palette),
             NavSection::Plugins => views::plugins_view::view(
                 &self.plugins,
@@ -2907,17 +3309,25 @@ impl SiphonApp {
                 self.browser_ext_connected,
                 palette,
             ),
-            NavSection::About => views::about_view::view(
-                &self.app_icon_handle,
-                &self.author_avatar_handle,
-                &self.update_status,
-                self.manager.data_dir(),
-                palette,
-            ),
+            NavSection::About => {
+                let auto_update_task = self
+                    .auto_update_task_id
+                    .and_then(|id| self.tasks.iter().find(|t| t.id == id));
+                views::about_view::view(
+                    &self.app_icon_handle,
+                    &self.author_avatar_handle,
+                    &self.update_status,
+                    auto_update_task,
+                    self.manager.data_dir(),
+                    palette,
+                )
+            }
             nav => {
                 let query = self.quick_input.trim().to_ascii_lowercase();
-                let filter_text =
-                    !query.is_empty() && !query.starts_with("http://") && !query.starts_with("https://");
+                let filter_text = !query.is_empty()
+                    && !query.starts_with("http://")
+                    && !query.starts_with("https://")
+                    && !query.starts_with("magnet:?");
 
                 let filtered: Vec<&DownloadTask> = self
                     .tasks
@@ -3041,7 +3451,7 @@ impl SiphonApp {
                         .size(16)
                         .font(FONT_MEDIUM)
                         .color(palette.text_primary),
-                    text("支持浏览器超链接、地址栏 URL、多行链接文本与 .url 快捷方式")
+                    text("支持浏览器超链接、地址栏 URL、HLS .m3u8、Magnet 磁力、.torrent 种子与 .url 快捷方式")
                         .size(13)
                         .font(FONT_REGULAR)
                         .color(palette.text_secondary),
@@ -3098,8 +3508,9 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
         let port = mgr.config().await.browser_bridge_port;
         spawn_browser_http_bridge(port, Arc::clone(&shared.browser_enabled), ipc_tx);
 
-        // Start 500ms global speed ticker inside Iced's Tokio runtime
+        // Start 500ms global speed ticker and 10s scheduler ticker inside Iced's Tokio runtime
         let mut speed_ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut sched_ticker = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
@@ -3167,6 +3578,9 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
                         active_count,
                     })).await;
                 }
+                _ = sched_ticker.tick() => {
+                    let _ = output.send(Message::SchedulerTick).await;
+                }
             }
         }
     })
@@ -3188,18 +3602,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Extract an HTTP/HTTPS URL from a dragged `.url` Windows shortcut or text file.
+/// Extract an HTTP/HTTPS/Magnet URL from a dragged `.url` Windows shortcut or text file.
 fn extract_url_from_dropped_file(path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     for line in raw.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("URL=").or_else(|| trimmed.strip_prefix("url=")) {
             let candidate = rest.trim();
-            if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            let low = candidate.to_ascii_lowercase();
+            if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?")
+            {
                 return Some(candidate.to_string());
             }
         }
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let low = trimmed.to_ascii_lowercase();
+        if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?") {
             return Some(trimmed.to_string());
         }
     }

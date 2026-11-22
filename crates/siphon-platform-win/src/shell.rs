@@ -537,3 +537,69 @@ pub fn export_browser_extension_zip(dest_zip: &Path) -> std::io::Result<PathBuf>
     std::fs::write(&norm, out)?;
     Ok(norm)
 }
+
+/// Execute a Windows system power action or user script when the download queue finishes.
+pub fn execute_power_action(
+    action: siphon_core::QueueCompleteAction,
+    custom_script: &str,
+) -> std::io::Result<()> {
+    use siphon_core::QueueCompleteAction;
+    #[cfg(windows)]
+    {
+        match action {
+            QueueCompleteAction::None | QueueCompleteAction::ExitApp => {}
+            QueueCompleteAction::Sleep => {
+                Command::new("rundll32.exe")
+                    .args(["powrprof.dll,SetSuspendState", "0,1,0"])
+                    .spawn()?;
+            }
+            QueueCompleteAction::Hibernate => {
+                Command::new("shutdown.exe").args(["/h"]).spawn()?;
+            }
+            QueueCompleteAction::Shutdown => {
+                Command::new("shutdown.exe")
+                    .args([
+                        "/s",
+                        "/t",
+                        "30",
+                        "/c",
+                        "Siphon 下载队列已全部完成，30 秒后自动关机（可运行 shutdown /a 取消）",
+                    ])
+                    .spawn()?;
+            }
+            QueueCompleteAction::RunScript => {
+                let cmd = custom_script.trim();
+                if !cmd.is_empty() {
+                    Command::new("cmd").args(["/C", cmd]).spawn()?;
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (action, custom_script);
+    }
+    Ok(())
+}
+
+/// Launch a downloaded Siphon Inno Setup installer in silent auto-upgrade mode.
+pub fn launch_silent_installer_update(installer_path: &Path) -> std::io::Result<()> {
+    let norm = normalize_win_path(installer_path);
+    #[cfg(windows)]
+    {
+        Command::new(&norm)
+            .args([
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/CLOSEAPPLICATIONS",
+                "/RESTARTAPPLICATIONS",
+            ])
+            .spawn()?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = norm;
+    }
+    Ok(())
+}

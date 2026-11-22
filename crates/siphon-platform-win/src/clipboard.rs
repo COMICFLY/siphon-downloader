@@ -27,6 +27,9 @@ pub fn extract_downloadable_url(raw: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.len() > 2048 || trimmed.contains('\n') || trimmed.contains(' ') {
         return None;
     }
+    if trimmed.to_ascii_lowercase().starts_with("magnet:?") {
+        return Some(trimmed.to_string());
+    }
     let parsed = url::Url::parse(trimmed).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
@@ -35,7 +38,8 @@ pub fn extract_downloadable_url(raw: &str) -> Option<String> {
     let known_exts = [
         ".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2", ".zst", ".tgz", ".iso", ".img",
         ".vhdx", ".exe", ".msi", ".msix", ".dmg", ".deb", ".rpm", ".apk", ".mp4", ".mkv", ".webm",
-        ".mov", ".mp3", ".flac", ".pdf", ".epub", ".bin", ".pkg", ".whl", ".jar",
+        ".mov", ".m3u8", ".mp3", ".flac", ".pdf", ".epub", ".bin", ".pkg", ".whl", ".jar",
+        ".torrent",
     ];
     let looks_like_download = known_exts.iter().any(|ext| path.ends_with(ext))
         || path.contains("/download")

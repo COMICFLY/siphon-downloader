@@ -7,6 +7,7 @@ pub mod inspector;
 pub mod new_task;
 pub mod plugins_view;
 pub mod rules_view;
+pub mod scheduler_view;
 pub mod settings;
 pub mod sidebar;
 pub mod task_list;

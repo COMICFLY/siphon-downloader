@@ -30,6 +30,86 @@ pub enum Language {
     EnUs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueCompleteAction {
+    #[default]
+    None,
+    ExitApp,
+    Sleep,
+    Hibernate,
+    Shutdown,
+    RunScript,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScheduleConfig {
+    /// Automatically resume paused/queued tasks at `start_time` (`HH:MM`, 24-hour local time).
+    pub start_enabled: bool,
+    pub start_time: String,
+    /// Automatically pause active tasks at `stop_time` (`HH:MM`, 24-hour local time).
+    pub stop_enabled: bool,
+    pub stop_time: String,
+    /// Automatically cap global download speed during `[speed_start_time, speed_end_time]`.
+    pub speed_schedule_enabled: bool,
+    pub speed_start_time: String,
+    pub speed_end_time: String,
+    /// Scheduled global speed limit in KB/s (e.g. `5120` = 5 MB/s).
+    pub scheduled_speed_limit_kbps: u64,
+    /// Action executed when all active/queued downloads finish.
+    pub on_queue_complete: QueueCompleteAction,
+    /// Custom command/script executed when `on_queue_complete == RunScript`.
+    pub post_queue_script: String,
+    /// Reset `on_queue_complete` back to `None` after triggering once to prevent accidental repeated shutdowns.
+    pub one_shot_complete_action: bool,
+}
+
+impl Default for ScheduleConfig {
+    fn default() -> Self {
+        Self {
+            start_enabled: false,
+            start_time: "02:00".to_string(),
+            stop_enabled: false,
+            stop_time: "07:00".to_string(),
+            speed_schedule_enabled: false,
+            speed_start_time: "09:00".to_string(),
+            speed_end_time: "23:00".to_string(),
+            scheduled_speed_limit_kbps: 5120,
+            on_queue_complete: QueueCompleteAction::None,
+            post_queue_script: String::new(),
+            one_shot_complete_action: true,
+        }
+    }
+}
+
+/// Parse `HH:MM` (24-hour) into minutes since midnight (`0..1440`).
+pub fn parse_hhmm(raw: &str) -> Option<u16> {
+    let (h, m) = raw.trim().split_once(':')?;
+    let hh: u16 = h.trim().parse().ok()?;
+    let mm: u16 = m.trim().parse().ok()?;
+    if hh < 24 && mm < 60 {
+        Some(hh * 60 + mm)
+    } else {
+        None
+    }
+}
+
+/// Check whether `now_mins` falls within `[start_hhmm, end_hhmm)` (supports overnight wrap like `23:00` -> `07:00`).
+pub fn is_time_in_window(now_mins: u16, start_hhmm: &str, end_hhmm: &str) -> bool {
+    let (Some(start), Some(end)) = (parse_hhmm(start_hhmm), parse_hhmm(end_hhmm)) else {
+        return false;
+    };
+    if start == end {
+        return false;
+    }
+    if start < end {
+        now_mins >= start && now_mins < end
+    } else {
+        now_mins >= start || now_mins < end
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -64,6 +144,7 @@ pub struct AppConfig {
     pub clipboard_capture_popup: bool,
     pub proxy_url: Option<String>,
     pub user_agent: String,
+    pub schedule: ScheduleConfig,
 }
 
 impl Default for AppConfig {
@@ -95,6 +176,7 @@ impl Default for AppConfig {
             clipboard_capture_popup: false,
             proxy_url: None,
             user_agent: format!("Siphon/{} (Windows NT 10.0; Win64; x64)", env!("CARGO_PKG_VERSION")),
+            schedule: ScheduleConfig::default(),
         }
     }
 }

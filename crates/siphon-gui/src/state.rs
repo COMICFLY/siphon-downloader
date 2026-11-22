@@ -1,7 +1,7 @@
 use iced::{Point, window};
 use siphon_core::{
     AppConfig, AutomationRule, DownloadTask, ExternalPlugin, FileCategory, Language, ListDensity,
-    ProbePreview, TaskEvent, TaskId, TaskSource, ThemeMode,
+    ProbePreview, QueueCompleteAction, TaskEvent, TaskId, TaskSource, ThemeMode,
 };
 use siphon_engine_http::UpdateInfo;
 use siphon_platform_win::{
@@ -18,6 +18,7 @@ pub enum NavSection {
     Completed,
     Paused,
     Category(FileCategory),
+    Scheduler,
     Rules,
     Plugins,
     Settings,
@@ -42,6 +43,8 @@ pub enum InputTarget {
     ModalSaveDir,
     ModalSpeedLimit,
     ModalSha256,
+    ModalBatchUrls,
+    ModalBatchFilter,
     ReplaceUrl,
     RuleName,
     RuleExtensions,
@@ -55,6 +58,12 @@ pub enum InputTarget {
     SettingsUserAgent,
     SettingsAccentHex,
     SettingsPopupAccentHex,
+    SchedStartTime,
+    SchedStopTime,
+    SchedSpeedStart,
+    SchedSpeedEnd,
+    SchedSpeedKbps,
+    SchedScript,
     CaptureFilename,
     CaptureSaveDir,
 }
@@ -107,7 +116,10 @@ pub struct ContextMenuState {
 #[derive(Debug, Clone, Default)]
 pub struct NewTaskModalState {
     pub open: bool,
+    pub batch_mode: bool,
     pub url: String,
+    pub batch_text: String,
+    pub batch_filter: String,
     pub filename: String,
     pub save_dir: String,
     pub connections: u32,
@@ -255,6 +267,28 @@ pub enum Message {
     ModalProbeUrl,
     ModalProbeFinished(std::result::Result<ProbePreview, String>),
     ModalSubmit(bool),
+    ModalToggleBatchMode(bool),
+    ModalBatchTextChanged(String),
+    ModalBatchFilterChanged(String),
+    ModalBatchPasteClipboard,
+    ModalPickTorrentFile,
+    ModalTorrentFilePicked(Option<PathBuf>),
+    ModalBatchSubmit(bool),
+
+    // Scheduler & Queue Complete Actions
+    SchedToggleStart(bool),
+    SchedStartTimeChanged(String),
+    SchedToggleStop(bool),
+    SchedStopTimeChanged(String),
+    SchedToggleSpeed(bool),
+    SchedSpeedStartChanged(String),
+    SchedSpeedEndChanged(String),
+    SchedSpeedKbpsChanged(String),
+    SchedSetCompleteAction(QueueCompleteAction),
+    SchedScriptChanged(String),
+    SchedToggleOneShot(bool),
+    SchedSave,
+    SchedulerTick,
 
     // Rules workspace
     RuleDraftName(String),
@@ -325,6 +359,8 @@ pub enum Message {
     UpdateCheckFinished(std::result::Result<UpdateInfo, String>),
     OpenExternalUrl(String),
     DownloadUpdateInstaller(String),
+    StartAutoUpdate(String),
+    AutoUpdateTaskStarted(std::result::Result<DownloadTask, String>),
     SaveSettings,
     SettingsSaved(std::result::Result<AppConfig, String>),
 

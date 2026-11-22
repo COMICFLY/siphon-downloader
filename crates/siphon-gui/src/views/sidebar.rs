@@ -178,6 +178,12 @@ pub fn view<'a>(
         cat_col,
         space::vertical().height(14),
         section_label(strings.nav_workspace()),
+        nav_item(
+            NavSection::Scheduler,
+            strings.scheduler(),
+            IconKind::Clock,
+            None,
+        ),
         nav_item(NavSection::Rules, strings.rules(), IconKind::Rules, None),
         nav_item(
             NavSection::Plugins,

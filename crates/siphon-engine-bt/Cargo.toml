@@ -1,0 +1,19 @@
+[package]
+name = "siphon-engine-bt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+siphon-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+librqbit = { version = "9.1", default-features = false, features = ["default-tls"] }
+
+[dev-dependencies]
+tempfile.workspace = true

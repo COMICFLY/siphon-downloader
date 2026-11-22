@@ -1,15 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Siphon Download Capture",
-  "version": "0.2.0",
-  "description": "自动接管 Chrome / Edge 浏览器下载，支持右键任意链接、图片、音视频、选中文本与页面资源一键提交至 Siphon 多线程下载器（携带 Cookie 与 Referer）",
+  "version": "0.3.0",
+  "description": "自动接管 Chrome / Edge 浏览器下载，支持 HLS (.m3u8) 流媒体实时嗅探、磁力链接、右键任意资源与页面批量提交至 Siphon 多线程下载器",
   "permissions": [
     "downloads",
     "cookies",
     "contextMenus",
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"

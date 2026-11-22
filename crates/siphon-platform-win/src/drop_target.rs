@@ -17,7 +17,10 @@ pub fn extract_urls_from_text(raw: &str) -> Vec<String> {
         let trimmed = token
             .trim()
             .trim_matches(|c| matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']'));
-        if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        let low = trimmed.to_ascii_lowercase();
+        if (low.starts_with("http://")
+            || low.starts_with("https://")
+            || low.starts_with("magnet:?"))
             && url::Url::parse(trimmed).is_ok()
             && seen.insert(trimmed.to_string())
         {
