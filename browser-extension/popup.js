@@ -3,25 +3,45 @@ const dot = document.getElementById("dot");
 const statusEl = document.getElementById("status");
 const launchBtn = document.getElementById("launchBtn");
 const toggleEl = document.getElementById("toggle");
-const autoSniffEl = document.getElementById("autoSniffToggle");
+const sniffToggleEl = document.getElementById("sniffToggle");
 const urlInput = document.getElementById("urlInput");
 const sendBtn = document.getElementById("sendBtn");
 const resCount = document.getElementById("resCount");
 const sniffSummary = document.getElementById("sniffSummary");
 const openSniffBtn = document.getElementById("openSniffBtn");
 
-chrome.storage.local.get({ enabled: true, autoSniffToClient: true }, (res) => {
+chrome.storage.local.get({ enabled: true, sniffEnabled: false }, (res) => {
   toggleEl.checked = Boolean(res.enabled);
-  autoSniffEl.checked = Boolean(res.autoSniffToClient);
+  const sniffing = Boolean(res.sniffEnabled);
+  sniffToggleEl.checked = sniffing;
+  if (sniffing) {
+    loadPageSummary();
+  } else {
+    renderSniffDisabledState();
+  }
 });
 
 toggleEl.addEventListener("change", () => {
   chrome.storage.local.set({ enabled: toggleEl.checked });
 });
 
-autoSniffEl.addEventListener("change", () => {
-  chrome.storage.local.set({ autoSniffToClient: autoSniffEl.checked });
+sniffToggleEl.addEventListener("change", () => {
+  const on = sniffToggleEl.checked;
+  chrome.storage.local.set({ sniffEnabled: on });
+  if (on) {
+    resCount.textContent = "扫描中...";
+    loadPageSummary();
+  } else {
+    renderSniffDisabledState();
+  }
 });
+
+function renderSniffDisabledState() {
+  resCount.textContent = "已关闭";
+  sniffSummary.innerHTML =
+    '<span class="pill">嗅探默认关闭（仅下载时拉起客户端）；开启上方开关即可自动捕获流媒体</span>';
+  openSniffBtn.textContent = "手动扫描并交由 Siphon 弹窗管理";
+}
 
 async function checkStatus() {
   try {
@@ -67,7 +87,7 @@ function loadPageSummary() {
     const items = resp.items || [];
     resCount.textContent = `${items.length} 项`;
     if (items.length === 0) {
-      sniffSummary.innerHTML = '<span class="pill">未发现直链或流媒体，播放视频后将自动嗅探</span>';
+      sniffSummary.innerHTML = '<span class="pill">暂未捕获资源，播放音视频后将自动推送到客户端弹窗</span>';
       openSniffBtn.textContent = "打开 Siphon 资源嗅探管理窗";
       return;
     }
@@ -137,4 +157,3 @@ sendBtn.addEventListener("click", () => {
 });
 
 checkStatus();
-loadPageSummary();

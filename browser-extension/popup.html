@@ -166,19 +166,19 @@
     </div>
     <div class="divider"></div>
     <div class="row">
-      <span>嗅探到流媒体自动弹出客户端窗口</span>
-      <input id="autoSniffToggle" type="checkbox" checked />
+      <span>启用网页资源嗅探（默认关闭）</span>
+      <input id="sniffToggle" type="checkbox" />
     </div>
-    <div class="sub">若 Siphon 客户端未运行，触发下载或资源嗅探时会自动拉起客户端</div>
+    <div class="sub">默认仅在下载时自动拉起客户端；手动启用嗅探后才会捕获流媒体并交由客户端弹窗管理</div>
   </div>
 
   <div class="card">
     <div class="res-header">
-      <span>当前页嗅探资源（客户端独立弹窗管理）</span>
-      <span id="resCount" class="res-count">扫描中...</span>
+      <span>当前页资源嗅探（客户端独立弹窗）</span>
+      <span id="resCount" class="res-count">未启用</span>
     </div>
     <div id="sniffSummary" class="sniff-summary"></div>
-    <button id="openSniffBtn" class="accent">在 Siphon 独立弹窗管理当前页资源</button>
+    <button id="openSniffBtn" class="accent">手动扫描并交由 Siphon 弹窗管理</button>
   </div>
 
   <div class="card" style="margin-bottom: 0;">

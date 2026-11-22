@@ -1,6 +1,6 @@
 const SIPHON_ENDPOINT = "http://127.0.0.1:16800";
 const NATIVE_HOST_NAME = "com.siphon.downloader";
-const CLIENT_VERSION = "chrome-extension/0.5.0";
+const CLIENT_VERSION = "chrome-extension/0.5.1";
 
 const CAPTURE_EXT_RE = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|ts|m4v|m3u8|mp3|flac|wav|aac|ogg|m4a|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
 const M3U8_URL_RE = /\.m3u8(\?|$)/i;
@@ -11,11 +11,43 @@ const DOWNLOADABLE_URL_RE = /(?:https?:\/\/[^\s"'<>()\[\]{}]+|magnet:\?[^\s"'<>(
 // Keep track of download IDs already handled to avoid duplicate capture
 const handledIds = new Set();
 
-// Live-sniffed network streams per browser tab (HLS / video / audio)
+// Sniffing is DISABLED by default; user must opt-in manually.
+// When disabled, Siphon is ONLY auto-launched on actual download actions.
+let sniffEnabled = false;
+
+// Live-sniffed network streams per browser tab (only populated when sniffEnabled === true)
 const tabSniffedStreams = new Map();
-// Track tabs that already auto-popped the client sniff window for the current page URL
 const tabAutoPoppedUrl = new Map();
 const tabAutoTimers = new Map();
+
+function syncSniffFlagFromStorage() {
+  chrome.storage.local.get({ sniffEnabled: false }, (res) => {
+    sniffEnabled = Boolean(res.sniffEnabled);
+    if (!sniffEnabled) {
+      clearAllSniffCaches();
+    }
+  });
+}
+
+function clearAllSniffCaches() {
+  tabSniffedStreams.clear();
+  tabAutoPoppedUrl.clear();
+  for (const timer of tabAutoTimers.values()) {
+    clearTimeout(timer);
+  }
+  tabAutoTimers.clear();
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.sniffEnabled) {
+    sniffEnabled = Boolean(changes.sniffEnabled.newValue);
+    if (!sniffEnabled) {
+      clearAllSniffCaches();
+    }
+  }
+});
+
+syncSniffFlagFromStorage();
 
 function isHttpUrl(url) {
   return typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"));
@@ -62,6 +94,7 @@ function sendNativeToSiphon(ipcCommand) {
 }
 
 function recordNetworkStream(tabId, item) {
+  if (!sniffEnabled) return false;
   if (typeof tabId !== "number" || tabId < 0 || !isHttpUrl(item.url)) return false;
   if (item.url.startsWith("http://127.0.0.1") || item.url.startsWith("http://localhost")) return false;
 
@@ -92,13 +125,14 @@ function recordNetworkStream(tabId, item) {
 }
 
 function scheduleAutoSniffPush(tabId) {
+  if (!sniffEnabled) return;
   if (tabAutoTimers.has(tabId)) {
     clearTimeout(tabAutoTimers.get(tabId));
   }
   const timer = setTimeout(async () => {
     tabAutoTimers.delete(tabId);
-    const st = await chrome.storage.local.get({ autoSniffToClient: true });
-    if (!st.autoSniffToClient) return;
+    const st = await chrome.storage.local.get({ sniffEnabled: false });
+    if (!st.sniffEnabled) return;
 
     let tab = null;
     try {
@@ -123,9 +157,10 @@ function scheduleAutoSniffPush(tabId) {
   tabAutoTimers.set(tabId, timer);
 }
 
-// Sniff .m3u8 playlist URLs immediately on request
+// Sniff .m3u8 playlist URLs ONLY when user manually enabled sniffing
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
+    if (!sniffEnabled) return;
     if (details.tabId >= 0 && M3U8_URL_RE.test(details.url)) {
       const added = recordNetworkStream(details.tabId, {
         url: details.url,
@@ -139,9 +174,10 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ["<all_urls>"] }
 );
 
-// Sniff HLS, video, and audio streams via Content-Type & Content-Length headers
+// Sniff HLS, video, and audio streams ONLY when user manually enabled sniffing
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
+    if (!sniffEnabled) return;
     if (details.tabId < 0 || !details.responseHeaders) return;
     let contentType = "";
     let contentLength = null;
@@ -170,7 +206,6 @@ chrome.webRequest.onHeadersReceived.addListener(
       (contentType.startsWith("video/") && !contentType.includes("mp2t")) ||
       VIDEO_URL_RE.test(details.url)
     ) {
-      // Ignore tiny video beacons (< 256 KB) when Content-Length is known
       if (contentLength === null || contentLength >= 256 * 1024) {
         kind = "video";
         label = "视频流媒体";
@@ -279,7 +314,7 @@ function registerContextMenus() {
       contexts: ["selection"]
     });
 
-    // 5. Hand off all sniffed page resources to Siphon's standalone Sniff Manager window
+    // 5. Manual explicit sniff of current page into client Sniff Manager window
     chrome.contextMenus.create({
       id: "siphon-sniff-page",
       title: "使用 Siphon 嗅探当前页资源（独立弹窗管理）",
@@ -289,12 +324,16 @@ function registerContextMenus() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.set({ enabled: true, autoSniffToClient: true });
+  // Default: download interception ON, resource sniffing OFF (opt-in only)
+  chrome.storage.local.set({ enabled: true, sniffEnabled: false });
+  sniffEnabled = false;
+  clearAllSniffCaches();
   registerContextMenus();
   notifySiphonAlive();
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  syncSniffFlagFromStorage();
   registerContextMenus();
   notifySiphonAlive();
 });
@@ -350,7 +389,6 @@ async function scanTabResources(tabId, mode) {
           });
         };
 
-        // Always collect <video> / <audio> and child <source>
         document.querySelectorAll("video, audio").forEach((el) => {
           const kind = el.tagName.toLowerCase();
           if (el.currentSrc) add(el.currentSrc, kind, el.getAttribute("title") || kind);
@@ -364,7 +402,6 @@ async function scanTabResources(tabId, mode) {
           return found;
         }
 
-        // Collect downloadable <a href> links, magnets, ed2k, and torrents
         document.querySelectorAll("a[href]").forEach((a) => {
           const href = a.href;
           if (!href) return;
@@ -384,7 +421,6 @@ async function scanTabResources(tabId, mode) {
         });
 
         if (scanMode === "all") {
-          // Also collect large images (>= 200x200)
           document.querySelectorAll("img[src]").forEach((img) => {
             if ((img.naturalWidth || 0) >= 200 && (img.naturalHeight || 0) >= 200) {
               add(img.currentSrc || img.src, "image", img.alt || "");
@@ -401,7 +437,6 @@ async function scanTabResources(tabId, mode) {
     domItems = [];
   }
 
-  // Merge live network-sniffed HLS/video/audio streams at the top, deduplicated by URL
   const merged = [];
   const seen = new Set();
   for (const item of [...netSniffed, ...domItems]) {
@@ -551,7 +586,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       });
       flashBadge(ok ? "OK" : "!", ok ? "#22C55E" : "#E55353");
     } else {
-      // Hand off multi-URL selection to Siphon's standalone Sniff Manager window!
       const items = urls.map((u) => ({
         url: u,
         filename: null,
@@ -663,7 +697,7 @@ async function sendToSiphon({ url, filename, referrer, mime, fileSize, silent = 
       return Boolean(data && data.ok && data.captured);
     }
   } catch (_) {
-    // Client not running -> auto-launch via Native Messaging Host and deliver payload!
+    // Client not running -> auto-launch via Native Messaging Host on download!
     const nativeReply = await sendNativeToSiphon({
       type: "browser_capture",
       ...payload
@@ -686,7 +720,6 @@ async function sendSniffToSiphon(tab, items, bringToFront = true) {
     bring_to_front: Boolean(bringToFront)
   };
 
-  // 1. Fast path: local HTTP bridge when Siphon is already running
   try {
     const resp = await fetch(`${SIPHON_ENDPOINT}/api/sniff`, {
       method: "POST",
@@ -698,7 +731,7 @@ async function sendSniffToSiphon(tab, items, bringToFront = true) {
       return Boolean(data && data.ok);
     }
   } catch (_) {
-    // Client not running -> auto-launch Siphon via Native Messaging Host and open Sniff Manager popup!
+    // Explicit/enabled sniff action when client is closed -> auto-launch client and open Sniff Manager
     const nativeReply = await sendNativeToSiphon({
       type: "browser_sniff",
       ...payload
