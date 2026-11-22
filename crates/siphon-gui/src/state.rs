@@ -65,7 +65,7 @@ pub enum CaptureAction {
     Later,
     /// "后台下载" — start downloading silently in background without opening a progress detail popup.
     Background,
-    /// "开始下载" — start downloading immediately AND open the standalone IDM-style green download detail popup window.
+    /// "开始下载" — start downloading immediately AND open the standalone download detail popup window.
     StartWithDialog,
 }
 
@@ -168,7 +168,7 @@ pub enum Message {
     ShortcutFocusQuickBar,
     ShortcutEscape,
 
-    // Standalone IDM-style Browser / Clipboard Capture Popup Window
+    // Standalone Browser / Clipboard Capture Popup Window
     CaptureWindowOpened(window::Id),
     CaptureWindowRawId(u64),
     CaptureDragWindow,
@@ -182,7 +182,7 @@ pub enum Message {
     CaptureStartedWithDialog(std::result::Result<DownloadTask, String>),
     CaptureCancel,
 
-    // Standalone IDM-style Per-Task Download Progress Detail Popup Window (Green Theme)
+    // Standalone Per-Task Download Progress Detail Popup Window
     OpenTaskDetailPopup(TaskId),
     DownloadPopupRawId(window::Id, u64),
     DownloadPopupDrag(window::Id),

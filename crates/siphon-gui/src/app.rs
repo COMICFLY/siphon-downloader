@@ -611,7 +611,7 @@ impl SiphonApp {
         Task::batch([win_task, icon_task, probe_task])
     }
 
-    /// Open or focus the standalone IDM-style green download progress detail popup window for `task_id`.
+    /// Open or focus the standalone download progress detail popup window for `task_id`.
     fn open_download_detail_popup(&mut self, task_id: TaskId) -> Task<Message> {
         if let Some(existing) = self
             .download_popups
@@ -1202,7 +1202,7 @@ impl SiphonApp {
                 }
             },
 
-            // Clipboard monitor banner or direct IDM-style capture popup
+            // Clipboard monitor banner or direct floating capture popup
             Message::ClipboardUrlDetected(url) => {
                 if self.config.clipboard_capture_popup {
                     if self
@@ -2839,7 +2839,7 @@ impl SiphonApp {
     pub fn view(&self, window_id: window::Id) -> Element<'_, Message> {
         let palette = self.palette();
 
-        // Render standalone IDM-style capture floating window when `window_id` belongs to `capture_popup`
+        // Render standalone capture floating window when `window_id` belongs to `capture_popup`
         if let Some(popup) = &self.capture_popup
             && popup.window_id == Some(window_id)
         {
@@ -2858,7 +2858,7 @@ impl SiphonApp {
             return popup_base;
         }
 
-        // Render standalone IDM-style green download progress detail window when `window_id` belongs to `download_popups`
+        // Render standalone download progress detail window when `window_id` belongs to `download_popups`
         if let Some(dp) = self.download_popups.get(&window_id) {
             let task = self.tasks.iter().find(|t| t.id == dp.task_id);
             let sys_icon = task.and_then(|t| {

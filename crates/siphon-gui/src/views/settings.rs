@@ -330,7 +330,7 @@ pub fn view<'a>(
     );
 
     let browser_card = settings_card(
-        "浏览器与剪贴板下载捕获（IDM 风格）",
+        "浏览器与剪贴板下载捕获",
         column![
             setting_row(
                 "接管浏览器下载请求",
@@ -341,7 +341,7 @@ pub fn view<'a>(
             rule::horizontal(1).style(hairline_rule_style(palette)),
             setting_row(
                 "浏览器捕获时弹出独立悬浮小窗",
-                "类似 IDM：主窗口最小化在托盘时仅弹出独立置顶捕获小窗；关闭则按规则静默直下",
+                "主窗口最小化在托盘时仅弹出独立置顶捕获小窗；关闭则按规则静默直下",
                 toggler(cfg.browser_capture_popup).on_toggle(Message::ToggleBrowserCapturePopup),
                 palette,
             ),

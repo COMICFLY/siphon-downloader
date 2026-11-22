@@ -42,7 +42,7 @@ pub struct AppConfig {
     pub theme_mode: ThemeMode,
     /// Primary accent color in `#RRGGBB` format (default `#38BDF8` Cool-Cyan).
     pub accent_color: String,
-    /// Download telemetry accent color for the standalone IDM-style download detail popup (default `#22C55E` Emerald Green).
+    /// Download telemetry accent color for the standalone download detail popup (default `#22C55E` Emerald Green).
     pub download_popup_accent: String,
     pub use_mica: bool,
     pub list_density: ListDensity,
@@ -58,9 +58,9 @@ pub struct AppConfig {
     pub browser_integration: bool,
     /// Local loopback port for the browser extension HTTP bridge.
     pub browser_bridge_port: u16,
-    /// Pop up the standalone IDM-style capture window when a browser download is intercepted.
+    /// Pop up the standalone floating capture window when a browser download is intercepted.
     pub browser_capture_popup: bool,
-    /// Pop up the standalone IDM-style capture window immediately when a download link is copied to clipboard.
+    /// Pop up the standalone floating capture window immediately when a download link is copied to clipboard.
     pub clipboard_capture_popup: bool,
     pub proxy_url: Option<String>,
     pub user_agent: String,

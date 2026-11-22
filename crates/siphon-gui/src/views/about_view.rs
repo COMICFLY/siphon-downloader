@@ -76,7 +76,7 @@ pub fn view<'a>(
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            text("纯 Rust 编写的 Windows 11 高性能多线程下载器 · 动态二分借片 · IDM 风格悬浮捕获小窗 · 规则引擎 · 浏览器扩展接管")
+            text("纯 Rust 编写的 Windows 11 高性能多线程下载器 · 动态二分借片 · 独立悬浮捕获小窗 · 规则引擎 · 浏览器扩展接管")
                 .size(13)
                 .font(FONT_REGULAR)
                 .color(palette.text_secondary),
