@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/siphon-core",
+    "crates/siphon-engine-http",
+    "crates/siphon-platform-win",
+    "crates/siphon-gui",
+    "crates/siphon-native-host",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+siphon-core = { path = "crates/siphon-core" }
+siphon-engine-http = { path = "crates/siphon-engine-http" }
+siphon-platform-win = { path = "crates/siphon-platform-win" }
+
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "charset", "system-proxy", "stream", "cookies", "socks", "json"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.2"
+dirs = "7"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+percent-encoding = "2"
+glob-match = "0.2"
+sha2 = "0.10"
+md-5 = "0.10"
+blake3 = "1"
+hex = "0.4"
+regex = "1"
+
+# GUI & Windows 11 integration (omit `web-colors` so Iced uses true linear sRGB gamma-corrected text anti-aliasing!)
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "crisp", "thread-pool", "tokio", "canvas", "svg", "image-without-codecs", "advanced", "advanced-shaping"] }
+tray-icon = "0.26"
+arboard = "3.7"
+rfd = "0.18"
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Dev / testing
+tempfile = "3"
+axum = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

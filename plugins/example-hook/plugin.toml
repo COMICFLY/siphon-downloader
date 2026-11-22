@@ -1,0 +1,8 @@
+name = "example-hook"
+version = "0.1.0"
+description = "示例外部插件：演示如何用 PowerShell/任意语言为 Siphon 编写站点解析与下载后处理钩子"
+enabled = false
+hooks = ["resolve", "post_download"]
+url_patterns = ["*://example.com/*"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "hook.ps1"]
+timeout_secs = 15

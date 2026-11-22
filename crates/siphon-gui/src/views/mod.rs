@@ -1,0 +1,13 @@
+pub mod about_view;
+pub mod capture_popup;
+pub mod delete_confirm;
+pub mod download_popup;
+pub mod ext_install_modal;
+pub mod inspector;
+pub mod new_task;
+pub mod plugins_view;
+pub mod rules_view;
+pub mod settings;
+pub mod sidebar;
+pub mod task_list;
+pub mod titlebar;

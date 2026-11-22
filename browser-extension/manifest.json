@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Siphon Download Capture",
+  "version": "0.2.0",
+  "description": "自动接管 Chrome / Edge 浏览器下载，支持右键任意链接、图片、音视频、选中文本与页面资源一键提交至 Siphon 多线程下载器（携带 Cookie 与 Referer）",
+  "permissions": [
+    "downloads",
+    "cookies",
+    "contextMenus",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Siphon 下载捕获",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  }
+}

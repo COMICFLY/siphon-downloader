@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 340px;
+      background: #141518;
+      color: #EDEDEF;
+      font-family: "MiSans", "Segoe UI", system-ui, sans-serif;
+      padding: 15px;
+      font-size: 13px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .brand {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: 6px;
+      font-size: 12px;
+      background: #191B1F;
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #9A9CA6;
+    }
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #6B6E78;
+    }
+    .dot.ok { background: #22C55E; }
+    .card {
+      background: #191B1F;
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 10px;
+      padding: 11px 12px;
+      margin-bottom: 10px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .sub {
+      color: #6B6E78;
+      font-size: 11px;
+      margin-top: 4px;
+      line-height: 1.45;
+    }
+    input[type="text"] {
+      width: 100%;
+      background: #141518;
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: 7px;
+      padding: 7px 10px;
+      color: #EDEDEF;
+      font-size: 12px;
+      outline: none;
+      margin-bottom: 8px;
+    }
+    button.primary {
+      width: 100%;
+      background: #ECEDF0;
+      color: #0F1012;
+      border: none;
+      border-radius: 7px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary:hover { background: #FFFFFF; }
+    .res-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-size: 12px;
+      color: #9A9CA6;
+    }
+    .res-list {
+      max-height: 170px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .res-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: #141518;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 7px;
+      padding: 6px 8px;
+    }
+    .res-meta {
+      min-width: 0;
+      flex: 1;
+    }
+    .res-title {
+      font-size: 12px;
+      color: #EDEDEF;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .res-tag {
+      font-size: 10px;
+      color: #38BDF8;
+      margin-right: 5px;
+      text-transform: uppercase;
+    }
+    .res-btn {
+      flex-shrink: 0;
+      background: #22242A;
+      color: #EDEDEF;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      padding: 4px 9px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .res-btn:hover { background: #2D3038; }
+    .empty {
+      color: #6B6E78;
+      font-size: 11px;
+      text-align: center;
+      padding: 8px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="brand">Siphon 下载捕获</span>
+    <span class="badge"><span id="dot" class="dot"></span><span id="status">检测中</span></span>
+  </div>
+  <div class="card">
+    <div class="row">
+      <span>自动接管浏览器下载</span>
+      <input id="toggle" type="checkbox" checked />
+    </div>
+    <div class="sub">也可在网页任意链接、图片、音视频或选中文本上右键提交至 Siphon</div>
+  </div>
+  <div class="card">
+    <div class="res-header">
+      <span>当前页嗅探资源</span>
+      <span id="resCount">0 项</span>
+    </div>
+    <div id="resList" class="res-list">
+      <div class="empty">正在扫描当前页面...</div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom: 0;">
+    <input id="urlInput" type="text" placeholder="粘贴 http(s):// 链接发送到 Siphon" />
+    <button id="sendBtn" class="primary">发送到 Siphon 捕获小窗</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
