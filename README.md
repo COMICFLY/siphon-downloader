@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.4.0-38BDF8?style=flat-square" alt="Release" /></a>
+  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.5.0-38BDF8?style=flat-square" alt="Release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-0EA5E9?style=flat-square" alt="Platform" />
   <img src="https://img.shields.io/badge/language-Rust%202024-F97316?style=flat-square" alt="Rust" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="License" /></a>
@@ -40,13 +40,15 @@
 - **计划调度与下载完成动作（Scheduler）**：支持每日**定时自动开始/暂停下载队列**、**分时段自动全局限速**（支持跨午夜时段，离开时段后自动恢复默认限速），以及队列全部下载完成后自动执行 **退出软件 / 系统睡眠 / 系统休眠 / 30 秒倒计时关机 / 自定义 PowerShell 脚本**（默认开启单次触发自动重置保护）。
 - **批量通配符队列导入**：新建任务弹窗支持切换至「批量通配符队列」模式，支持 `[001-100]` 零填充数字区间、`[1-20:2]` 步长、`[a-z]` 字母范围、多通配符笛卡尔展开、剪贴板多行链接一键导入、关键词/后缀过滤与实时展开预览。
 
-### 3. 独立悬浮捕获小窗 & 独立下载详情小窗
+### 3. 独立悬浮捕获窗、独立资源嗅探管理窗 & 独立下载详情窗
 - **独立悬浮捕获小窗**：即使主窗口最小化常驻托盘，捕获到浏览器或剪贴板下载链接时也会独立置顶弹出，支持修改文件名、选择保存目录、查看断点续传/匹配规则/浏览器凭证状态，并提供 **开始下载 / 后台下载 / 稍后下载 / 取消** 四种动作。
+- **独立资源嗅探管理窗**：浏览器扩展实时嗅探到的 HLS（`.m3u8`）、视频、音频、直链文件、磁力/eD2k 与大图统一交由客户端独立弹窗管理，支持按类型分组筛选、关键词搜索、批量勾选/单条直下与自动携带浏览器 Cookie/Referer。
 - **独立下载详情监控窗**：点击「开始下载」后弹出独立任务监控窗，集中呈现传输状态、实时速率、剩余时间、60 秒吞吐曲线与连续无缝分片进度条；支持**转入后台**、**下载完成后自动关闭窗口**、完成后一键打开文件或定位所在目录。
 
-### 4. Chrome / Edge 浏览器下载捕获扩展（MV3 独立分发）
+### 4. Chrome / Edge 浏览器下载捕获扩展（MV3 独立分发 + 自动拉起客户端）
+- **未启动自动拉起客户端**：基于 Chrome / Edge Native Messaging Host（`siphon-native-host.exe`），当 Siphon 客户端未运行时，在浏览器触发下载接管、右键提交或资源嗅探均会**自动静默拉起客户端**并立即弹出对应独立管理窗。
 - **自动拦截接管**：监听本地 `127.0.0.1:16800` 桥接，自动携带浏览器 `Cookie`、`Referer` 与 `User-Agent` 接管大文件与指定格式下载。
-- **HLS（`.m3u8`）实时网络嗅探**：通过 `webRequest` 实时监听当前标签页加载的 `.m3u8` 与 `application/vnd.apple.mpegurl` 流媒体地址，置顶显示在扩展弹窗与右键菜单中，一键推送至 Siphon 并发下载合并。
+- **HLS（`.m3u8`）与音视频实时嗅探**：通过 `webRequest` 实时捕获 `.m3u8` 与音视频流（含大小识别），可自动或一键推送至客户端独立资源嗅探弹窗集中批量下载。
 - **网页资源全场景右键提交**：支持在网页任意**超链接（含 `magnet:?` 磁力）、图片、音视频、选中文本链接、当前页嗅探 HLS 流、页面批量资源**右键直接提交至 Siphon（含捕获弹窗与后台静默直下两种模式）。
 - **灵活分发方式**：安装包与 Release 页面均提供**独立 `browser-extension/` 文件夹**与**独立 `.zip` 扩展压缩包**，软件内亦内置自动识别默认浏览器的引导式安装向导与 `.zip` 一键导出。
 
@@ -85,11 +87,11 @@
 
 前往 [**GitHub Releases**](https://github.com/COMICFLY/siphon-downloader/releases) 下载对应文件：
 
-1. **`Siphon-Setup-0.4.0-x64.exe`（推荐）**：标准 Windows 安装包
+1. **`Siphon-Setup-0.5.0-x64.exe`（推荐）**：标准 Windows 安装包
    - 支持自由选择**程序安装目录**与**数据存储目录**；
    - 支持勾选创建桌面快捷方式与**开机静默启动**；
-   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.4.0.zip` 扩展压缩包。
-2. **`siphon-browser-extension-v0.4.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
+   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.5.0.zip` 扩展压缩包。
+2. **`siphon-browser-extension-v0.5.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
    - 解压后打开浏览器的 `chrome://extensions` 或 `edge://extensions`；
    - 开启右上角 **「开发者模式」**，将解压出的文件夹直接拖入浏览器扩展页即可完成加载。
 

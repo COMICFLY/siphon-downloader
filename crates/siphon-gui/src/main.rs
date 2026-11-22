@@ -19,7 +19,9 @@ fn main() -> iced::Result {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let start_minimized = args.iter().any(|a| a == "--minimized");
+    let start_minimized = args
+        .iter()
+        .any(|a| a == "--minimized" || a.eq_ignore_ascii_case("siphon://minimized"));
 
     // Support `--data-dir <PATH>` or `--data-dir=<PATH>` for controllable data directory
     for (i, arg) in args.iter().enumerate() {
@@ -37,7 +39,13 @@ fn main() -> iced::Result {
 
     let initial_url = args
         .iter()
-        .find(|a| a.starts_with("http://") || a.starts_with("https://"))
+        .find(|a| {
+            let low = a.to_ascii_lowercase();
+            low.starts_with("http://")
+                || low.starts_with("https://")
+                || low.starts_with("magnet:?")
+                || low.starts_with("ed2k://|file|")
+        })
         .cloned();
 
     // Single-instance check: if Siphon is already running, hand off via Named Pipe IPC and exit.

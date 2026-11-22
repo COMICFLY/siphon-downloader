@@ -58,6 +58,73 @@ impl BrowserCapturePayload {
     }
 }
 
+/// Single resource item discovered by the browser extension's real-time network or DOM sniffer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SniffedResourceItem {
+    pub url: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// Resource kind: `"hls"`, `"video"`, `"audio"`, `"file"`, `"image"`, `"magnet"`, `"torrent"`, `"ed2k"`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+/// Batch of sniffed resources pushed from a browser tab to Siphon's standalone Sniff Manager window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrowserSniffPayload {
+    #[serde(default)]
+    pub page_title: Option<String>,
+    #[serde(default)]
+    pub page_url: Option<String>,
+    #[serde(default)]
+    pub referrer: Option<String>,
+    #[serde(default)]
+    pub cookie: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub items: Vec<SniffedResourceItem>,
+    /// When `true`, focus and bring the standalone Sniff Manager popup to the foreground.
+    #[serde(default = "default_true_ipc")]
+    pub bring_to_front: bool,
+}
+
+fn default_true_ipc() -> bool {
+    true
+}
+
+impl BrowserSniffPayload {
+    pub fn merged_headers(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        if let Some(ref r) = self.referrer
+            && !r.trim().is_empty()
+        {
+            map.insert("Referer".to_string(), r.trim().to_string());
+        } else if let Some(ref u) = self.page_url
+            && !u.trim().is_empty()
+        {
+            map.insert("Referer".to_string(), u.trim().to_string());
+        }
+        if let Some(ref c) = self.cookie
+            && !c.trim().is_empty()
+        {
+            map.insert("Cookie".to_string(), c.trim().to_string());
+        }
+        if let Some(ref ua) = self.user_agent
+            && !ua.trim().is_empty()
+        {
+            map.insert("User-Agent".to_string(), ua.trim().to_string());
+        }
+        map
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcCommand {
@@ -72,6 +139,10 @@ pub enum IpcCommand {
         from_browser: bool,
     },
     BrowserCapture(BrowserCapturePayload),
+    BrowserSniff(BrowserSniffPayload),
+    ExtensionHandshake {
+        extension_id: String,
+    },
     Ping,
 }
 
@@ -292,7 +363,7 @@ pub fn spawn_browser_http_bridge(
                         "HTTP/1.1 204 No Content\r\n",
                         "Access-Control-Allow-Origin: *\r\n",
                         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n",
-                        "Access-Control-Allow-Headers: Content-Type, X-Siphon-Client\r\n",
+                        "Access-Control-Allow-Headers: Content-Type, X-Siphon-Client, X-Siphon-Extension-Id\r\n",
                         "Access-Control-Allow-Private-Network: true\r\n",
                         "Content-Length: 0\r\n",
                         "Connection: close\r\n\r\n"
@@ -300,6 +371,20 @@ pub fn spawn_browser_http_bridge(
                     let _ = stream.write_all(resp.as_bytes()).await;
                     let _ = stream.flush().await;
                     return;
+                }
+
+                // Auto-register any observed Chromium extension ID into Native Messaging allowed_origins
+                for line in headers_str.lines().skip(1) {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("x-siphon-extension-id")
+                    {
+                        let ext_id = v.trim();
+                        if ext_id.len() == 32 && ext_id.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+                            let _ = tx_conn.send(IpcCommand::ExtensionHandshake {
+                                extension_id: ext_id.to_string(),
+                            });
+                        }
+                    }
                 }
 
                 let is_enabled = flag.load(Ordering::Relaxed);
@@ -328,12 +413,7 @@ pub fn spawn_browser_http_bridge(
                         let json_body = json_str.trim_matches(char::from(0)).trim();
 
                         match serde_json::from_str::<BrowserCapturePayload>(json_body) {
-                            Ok(payload)
-                                if payload.url.starts_with("http://")
-                                    || payload.url.starts_with("https://")
-                                    || payload.url.to_ascii_lowercase().starts_with("magnet:?")
-                                    || payload.url.to_ascii_lowercase().starts_with("ed2k://|file|") =>
-                            {
+                            Ok(payload) if is_supported_browser_url(&payload.url) => {
                                 let _ = tx_conn.send(IpcCommand::BrowserCapture(payload));
                                 ("200 OK", r#"{"ok":true,"captured":true}"#.to_string())
                             }
@@ -343,6 +423,26 @@ pub fn spawn_browser_http_bridge(
                                     .to_string(),
                             ),
                         }
+                    }
+                } else if method.eq_ignore_ascii_case("POST")
+                    && (path == "/api/sniff" || path == "/sniff")
+                {
+                    let json_str = String::from_utf8_lossy(&body_bytes);
+                    let json_body = json_str.trim_matches(char::from(0)).trim();
+
+                    match serde_json::from_str::<BrowserSniffPayload>(json_body) {
+                        Ok(mut payload) => {
+                            payload
+                                .items
+                                .retain(|item| is_supported_browser_url(&item.url));
+                            let count = payload.items.len();
+                            let _ = tx_conn.send(IpcCommand::BrowserSniff(payload));
+                            ("200 OK", format!(r#"{{"ok":true,"received":{count}}}"#))
+                        }
+                        Err(_) => (
+                            "400 Bad Request",
+                            r#"{"ok":false,"reason":"invalid_sniff_payload"}"#.to_string(),
+                        ),
                     }
                 } else {
                     ("404 Not Found", r#"{"ok":false}"#.to_string())
@@ -357,6 +457,14 @@ pub fn spawn_browser_http_bridge(
             });
         }
     });
+}
+
+fn is_supported_browser_url(raw: &str) -> bool {
+    let low = raw.trim().to_ascii_lowercase();
+    low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("magnet:?")
+        || low.starts_with("ed2k://|file|")
 }
 
 #[cfg(test)]
@@ -456,5 +564,49 @@ mod tests {
             }
             other => panic!("expected BrowserCapture, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn local_http_bridge_accepts_browser_sniff_post() {
+        let enabled = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let port = 26821u16;
+        spawn_browser_http_bridge(port, Arc::clone(&enabled), tx);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        let body = r#"{"page_title":"Demo Video","page_url":"https://video.example.com/watch","bring_to_front":true,"items":[{"url":"https://cdn.example.com/live/master.m3u8","kind":"hls","label":"1080p HLS"},{"url":"javascript:void(0)","kind":"file"}]}"#;
+        let req = format!(
+            "POST /api/sniff HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nX-Siphon-Extension-Id: imcbffndjiifaihgngccjdohhcjkknim\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut client = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect bridge");
+        client.write_all(req.as_bytes()).await.expect("write sniff");
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.expect("read response");
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains(r#""received":1"#));
+
+        let c1 = rx.recv().await.expect("first cmd");
+        let c2 = rx.recv().await.expect("second cmd");
+        let mut got_handshake = false;
+        let mut got_sniff = false;
+        for c in [c1, c2] {
+            match c {
+                IpcCommand::ExtensionHandshake { extension_id } => {
+                    assert_eq!(extension_id, "imcbffndjiifaihgngccjdohhcjkknim");
+                    got_handshake = true;
+                }
+                IpcCommand::BrowserSniff(p) => {
+                    assert_eq!(p.page_title.as_deref(), Some("Demo Video"));
+                    assert_eq!(p.items.len(), 1);
+                    assert_eq!(p.items[0].kind, "hls");
+                    got_sniff = true;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert!(got_handshake && got_sniff);
     }
 }

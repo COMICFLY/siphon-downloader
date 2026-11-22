@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Siphon Download Capture",
-  "version": "0.4.0",
-  "description": "自动接管 Chrome / Edge 浏览器下载，支持 HLS (.m3u8) 流媒体实时嗅探、Magnet 磁力、eD2k 电驴链接、右键任意资源与页面批量提交至 Siphon",
+  "version": "0.5.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAke0BDal+SSXXO8ea1t3TvtZPuYgQineTTSiXxh07++pj+87qdeZ8Y0CMZnVQlZx3yNjxnJT447VGf5niKBOrhokH66aEk9sHIxrNVrbf4plPPeWHmiDo4dfdS5n68P5bWVvJvQS3bcb+gp0zI+VDGU8+6mY5GtNtPY7ovPtaFN+pCaUxRnFWoHG9azCP1vfUWc4LBDF8z4vxL9n9VAxi/A2f4FZUNc9RnLiCyqReXpHkGV7/OgN/RztNwsKdugUmzp4+W0qxVyB4JprFT9tf7HHk/DEna9LkX0+jw6TFf0RsODOJQYSE3UjorcC4HzGXJLZBczb43l9j9s2NqcZWBQIDAQAB",
+  "description": "自动接管 Chrome / Edge 浏览器下载与 HLS/音视频资源嗅探，交由 Siphon 客户端独立弹窗管理，支持未启动时自动拉起客户端",
   "permissions": [
     "downloads",
     "cookies",
@@ -10,7 +11,8 @@
     "storage",
     "activeTab",
     "scripting",
-    "webRequest"
+    "webRequest",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -25,7 +27,7 @@
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_title": "Siphon 下载捕获",
+    "default_title": "Siphon 下载捕获与资源嗅探",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",

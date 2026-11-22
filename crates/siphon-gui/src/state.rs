@@ -90,6 +90,8 @@ pub enum InputTarget {
     Ed2kNewServerPort,
     CaptureFilename,
     CaptureSaveDir,
+    SniffSearch,
+    SniffSaveDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +131,59 @@ pub struct CapturePopupState {
     pub dont_ask_again: bool,
     pub filename_edited_by_user: bool,
     pub save_dir_edited_by_user: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SniffFilterKind {
+    #[default]
+    All,
+    Hls,
+    Video,
+    Audio,
+    File,
+    P2p,
+    Image,
+}
+
+impl SniffFilterKind {
+    pub fn matches(self, kind: &str) -> bool {
+        let k = kind.to_ascii_lowercase();
+        match self {
+            Self::All => true,
+            Self::Hls => k == "hls",
+            Self::Video => k == "video",
+            Self::Audio => k == "audio",
+            Self::File => k == "file" || k.is_empty(),
+            Self::P2p => matches!(k.as_str(), "magnet" | "torrent" | "ed2k"),
+            Self::Image => k == "image",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SniffEntry {
+    pub id: usize,
+    pub url: String,
+    pub filename: String,
+    pub kind: String,
+    pub label: String,
+    pub mime: Option<String>,
+    pub file_size: Option<u64>,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SniffPopupState {
+    pub window_id: Option<window::Id>,
+    pub window_hwnd: Option<u64>,
+    pub page_title: String,
+    pub page_url: String,
+    pub headers: BTreeMap<String, String>,
+    pub items: Vec<SniffEntry>,
+    pub next_entry_id: usize,
+    pub filter: SniffFilterKind,
+    pub search: String,
+    pub save_dir: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +272,23 @@ pub enum Message {
     CaptureSubmit(CaptureAction),
     CaptureStartedWithDialog(std::result::Result<DownloadTask, String>),
     CaptureCancel,
+
+    // Standalone Browser Resource Sniff Manager Window
+    SniffWindowOpened(window::Id),
+    SniffWindowRawId(u64),
+    SniffDragWindow,
+    SniffClose,
+    SniffSetFilter(SniffFilterKind),
+    SniffSearchChanged(String),
+    SniffToggleItem(usize),
+    SniffSelectAllVisible(bool),
+    SniffRemoveItem(usize),
+    SniffClearAll,
+    SniffSaveDirChanged(String),
+    SniffBrowseDir,
+    SniffDirPicked(Option<PathBuf>),
+    SniffDownloadSingle(usize),
+    SniffDownloadSelected(bool),
 
     // Standalone Per-Task Download Progress Detail Popup Window
     OpenTaskDetailPopup(TaskId),

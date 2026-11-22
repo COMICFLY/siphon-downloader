@@ -1,6 +1,6 @@
 ; Siphon Downloader — Windows Standard Installer Script (Inno Setup 6)
 #define MyAppName "Siphon Downloader"
-#define MyAppVersion "0.4.0"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "COMICFLY"
 #define MyAppURL "https://github.com/COMICFLY/siphon-downloader"
 #define MyAppExeName "siphon.exe"
@@ -59,6 +59,16 @@ Name: "{autodesktop}\Siphon Downloader"; Filename: "{app}\{#MyAppExeName}"; Icon
 [Registry]
 ; Optional autostart entry (launches silently into system tray via --minimized)
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Siphon"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Flags: uninsdeletevalue; Tasks: autostart
+; Custom URL protocol (`siphon://`) so browsers can wake Siphon
+Root: HKCU; Subkey: "Software\Classes\siphon"; ValueType: string; ValueName: ""; ValueData: "URL:Siphon Downloader Protocol"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\siphon"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\siphon\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"",0"
+Root: HKCU; Subkey: "Software\Classes\siphon\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+; Chromium Native Messaging Hosts so Chrome/Edge/Brave/Vivaldi can auto-launch Siphon when closed
+Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\com.siphon.downloader"; ValueType: string; ValueName: ""; ValueData: "{app}\com.siphon.downloader.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\com.siphon.downloader"; ValueType: string; ValueName: ""; ValueData: "{app}\com.siphon.downloader.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.siphon.downloader"; ValueType: string; ValueName: ""; ValueData: "{app}\com.siphon.downloader.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Vivaldi\NativeMessagingHosts\com.siphon.downloader"; ValueType: string; ValueName: ""; ValueData: "{app}\com.siphon.downloader.json"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 Siphon Downloader"; Flags: nowait postinstall skipifsilent
@@ -92,9 +102,25 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   DataDir: String;
   PointerFile: String;
+  HostExeEscaped: String;
+  HostJson: String;
 begin
   if CurStep = ssPostInstall then
   begin
+    // Always write Native Messaging Host manifest beside siphon-native-host.exe so browser auto-launch works immediately
+    HostExeEscaped := ExpandConstant('{app}\siphon-native-host.exe');
+    StringChangeEx(HostExeEscaped, '\', '\\', True);
+    HostJson := '{' + #13#10 +
+      '  "name": "com.siphon.downloader",' + #13#10 +
+      '  "description": "Siphon Native Messaging Host",' + #13#10 +
+      '  "path": "' + HostExeEscaped + '",' + #13#10 +
+      '  "type": "stdio",' + #13#10 +
+      '  "allowed_origins": [' + #13#10 +
+      '    "chrome-extension://imcbffndjiifaihgngccjdohhcjkknim/"' + #13#10 +
+      '  ]' + #13#10 +
+      '}' + #13#10;
+    SaveStringToFile(ExpandConstant('{app}\com.siphon.downloader.json'), Utf8Encode(HostJson), False);
+
     PointerFile := ExpandConstant('{app}\data_dir.txt');
     // During silent in-app upgrades, preserve existing custom data_dir.txt if present
     if WizardSilent and FileExists(PointerFile) then

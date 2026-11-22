@@ -1,15 +1,21 @@
 const SIPHON_ENDPOINT = "http://127.0.0.1:16800";
-const CLIENT_VERSION = "chrome-extension/0.4.0";
-const MIN_INTERCEPT_SIZE = 256 * 1024;
+const NATIVE_HOST_NAME = "com.siphon.downloader";
+const CLIENT_VERSION = "chrome-extension/0.5.0";
+
 const CAPTURE_EXT_RE = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|ts|m4v|m3u8|mp3|flac|wav|aac|ogg|m4a|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
 const M3U8_URL_RE = /\.m3u8(\?|$)/i;
+const VIDEO_URL_RE = /\.(mp4|mkv|webm|mov|avi|flv|m4v)(\?|$)/i;
+const AUDIO_URL_RE = /\.(mp3|flac|wav|aac|ogg|m4a)(\?|$)/i;
 const DOWNLOADABLE_URL_RE = /(?:https?:\/\/[^\s"'<>()\[\]{}]+|magnet:\?[^\s"'<>()\[\]{}]+|ed2k:\/\/\|file\|[^\s"'<>()\[\]{}]+)/gi;
 
 // Keep track of download IDs already handled to avoid duplicate capture
 const handledIds = new Set();
 
-// Live-sniffed HLS (.m3u8) media streams per browser tab
-const tabHlsStreams = new Map();
+// Live-sniffed network streams per browser tab (HLS / video / audio)
+const tabSniffedStreams = new Map();
+// Track tabs that already auto-popped the client sniff window for the current page URL
+const tabAutoPoppedUrl = new Map();
+const tabAutoTimers = new Map();
 
 function isHttpUrl(url) {
   return typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"));
@@ -26,50 +32,165 @@ function isDownloadableUrl(url) {
   );
 }
 
-function recordHlsStream(tabId, url, label) {
-  if (typeof tabId !== "number" || tabId < 0 || !isHttpUrl(url)) return;
-  let list = tabHlsStreams.get(tabId);
-  if (!list) {
-    list = [];
-    tabHlsStreams.set(tabId, list);
-  }
-  if (list.some((item) => item.url === url)) return;
-  list.unshift({
-    url,
-    kind: "hls",
-    label: label || "HLS Stream (.m3u8)"
-  });
-  if (list.length > 24) {
-    list.length = 24;
-  }
+function bridgeHeaders(extra = {}) {
+  const h = {
+    "X-Siphon-Client": CLIENT_VERSION,
+    ...extra
+  };
+  try {
+    if (chrome.runtime && chrome.runtime.id) {
+      h["X-Siphon-Extension-Id"] = chrome.runtime.id;
+    }
+  } catch (_) {}
+  return h;
 }
 
-// Sniff .m3u8 playlist URLs from network requests
+function sendNativeToSiphon(ipcCommand) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, ipcCommand, (reply) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, launched: false, error: chrome.runtime.lastError.message || "native_error" });
+          return;
+        }
+        resolve(reply || { ok: false, launched: false });
+      });
+    } catch (e) {
+      resolve({ ok: false, launched: false, error: String(e) });
+    }
+  });
+}
+
+function recordNetworkStream(tabId, item) {
+  if (typeof tabId !== "number" || tabId < 0 || !isHttpUrl(item.url)) return false;
+  if (item.url.startsWith("http://127.0.0.1") || item.url.startsWith("http://localhost")) return false;
+
+  let list = tabSniffedStreams.get(tabId);
+  if (!list) {
+    list = [];
+    tabSniffedStreams.set(tabId, list);
+  }
+  const existing = list.find((x) => x.url === item.url);
+  if (existing) {
+    if (!existing.file_size && item.file_size) existing.file_size = item.file_size;
+    if (!existing.mime && item.mime) existing.mime = item.mime;
+    return false;
+  }
+
+  list.unshift({
+    url: item.url,
+    filename: item.filename || null,
+    kind: item.kind || "video",
+    label: item.label || null,
+    mime: item.mime || null,
+    file_size: typeof item.file_size === "number" && item.file_size > 0 ? item.file_size : null
+  });
+  if (list.length > 48) {
+    list.length = 48;
+  }
+  return true;
+}
+
+function scheduleAutoSniffPush(tabId) {
+  if (tabAutoTimers.has(tabId)) {
+    clearTimeout(tabAutoTimers.get(tabId));
+  }
+  const timer = setTimeout(async () => {
+    tabAutoTimers.delete(tabId);
+    const st = await chrome.storage.local.get({ autoSniffToClient: true });
+    if (!st.autoSniffToClient) return;
+
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return;
+    }
+    if (!tab || !tab.active || !tab.url || !isHttpUrl(tab.url)) return;
+
+    const streams = (tabSniffedStreams.get(tabId) || []).slice();
+    if (streams.length === 0) return;
+
+    // Bring client Sniff Manager popup to front once per page URL; merge silently for extra streams
+    const alreadyPopped = tabAutoPoppedUrl.get(tabId) === tab.url;
+    tabAutoPoppedUrl.set(tabId, tab.url);
+
+    const ok = await sendSniffToSiphon(tab, streams, !alreadyPopped);
+    if (ok) {
+      flashBadge(String(streams.length), "#22C55E");
+    }
+  }, 550);
+  tabAutoTimers.set(tabId, timer);
+}
+
+// Sniff .m3u8 playlist URLs immediately on request
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId >= 0 && M3U8_URL_RE.test(details.url)) {
-      recordHlsStream(details.tabId, details.url, null);
+      const added = recordNetworkStream(details.tabId, {
+        url: details.url,
+        kind: "hls",
+        label: "HLS Stream (.m3u8)",
+        mime: "application/vnd.apple.mpegurl"
+      });
+      if (added) scheduleAutoSniffPush(details.tabId);
     }
   },
   { urls: ["<all_urls>"] }
 );
 
-// Also sniff HLS playlists identified by Content-Type even when URL lacks .m3u8 extension
+// Sniff HLS, video, and audio streams via Content-Type & Content-Length headers
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0 || !details.responseHeaders) return;
+    let contentType = "";
+    let contentLength = null;
     for (const h of details.responseHeaders) {
-      if (h.name && h.name.toLowerCase() === "content-type" && h.value) {
-        const ct = h.value.toLowerCase();
-        if (
-          ct.includes("application/vnd.apple.mpegurl") ||
-          ct.includes("application/x-mpegurl") ||
-          ct.includes("audio/mpegurl")
-        ) {
-          recordHlsStream(details.tabId, details.url, "HLS Stream");
-          break;
-        }
+      if (!h.name || !h.value) continue;
+      const name = h.name.toLowerCase();
+      if (name === "content-type") {
+        contentType = h.value.toLowerCase().split(";")[0].trim();
+      } else if (name === "content-length") {
+        const parsed = parseInt(h.value, 10);
+        if (!Number.isNaN(parsed) && parsed > 0) contentLength = parsed;
       }
+    }
+
+    let kind = null;
+    let label = null;
+    if (
+      contentType.includes("application/vnd.apple.mpegurl") ||
+      contentType.includes("application/x-mpegurl") ||
+      contentType.includes("audio/mpegurl") ||
+      M3U8_URL_RE.test(details.url)
+    ) {
+      kind = "hls";
+      label = "HLS Stream (.m3u8)";
+    } else if (
+      (contentType.startsWith("video/") && !contentType.includes("mp2t")) ||
+      VIDEO_URL_RE.test(details.url)
+    ) {
+      // Ignore tiny video beacons (< 256 KB) when Content-Length is known
+      if (contentLength === null || contentLength >= 256 * 1024) {
+        kind = "video";
+        label = "视频流媒体";
+      }
+    } else if (contentType.startsWith("audio/") || AUDIO_URL_RE.test(details.url)) {
+      if (contentLength === null || contentLength >= 64 * 1024) {
+        kind = "audio";
+        label = "音频资源";
+      }
+    }
+
+    if (kind) {
+      const added = recordNetworkStream(details.tabId, {
+        url: details.url,
+        kind,
+        label,
+        mime: contentType || null,
+        file_size: contentLength
+      });
+      if (added) scheduleAutoSniffPush(details.tabId);
     }
   },
   { urls: ["<all_urls>"] },
@@ -77,12 +198,18 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  tabHlsStreams.delete(tabId);
+  tabSniffedStreams.delete(tabId);
+  tabAutoPoppedUrl.delete(tabId);
+  if (tabAutoTimers.has(tabId)) {
+    clearTimeout(tabAutoTimers.get(tabId));
+    tabAutoTimers.delete(tabId);
+  }
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" && changeInfo.url) {
-    tabHlsStreams.delete(tabId);
+    tabSniffedStreams.delete(tabId);
+    tabAutoPoppedUrl.delete(tabId);
   }
 });
 
@@ -90,7 +217,7 @@ async function notifySiphonAlive() {
   try {
     await fetch(`${SIPHON_ENDPOINT}/api/ping`, {
       method: "GET",
-      headers: { "X-Siphon-Client": CLIENT_VERSION }
+      headers: bridgeHeaders()
     });
   } catch (_) {}
 }
@@ -109,7 +236,7 @@ function flashBadge(text, color) {
 
 function registerContextMenus() {
   chrome.contextMenus.removeAll(() => {
-    // 1. Link resource (HTTP / Magnet / Torrent / HLS)
+    // 1. Link resource (HTTP / Magnet / Torrent / HLS / eD2k)
     chrome.contextMenus.create({
       id: "siphon-download-link",
       title: "使用 Siphon 下载此链接",
@@ -145,31 +272,24 @@ function registerContextMenus() {
       contexts: ["video", "audio"]
     });
 
-    // 4. Selected text containing URLs or magnet links
+    // 4. Selected text containing URLs, magnet, or ed2k links
     chrome.contextMenus.create({
       id: "siphon-download-selection",
       title: "使用 Siphon 下载选中文本中的链接",
       contexts: ["selection"]
     });
 
-    // 5. Sniffed HLS (.m3u8) stream on current page
+    // 5. Hand off all sniffed page resources to Siphon's standalone Sniff Manager window
     chrome.contextMenus.create({
-      id: "siphon-download-hls",
-      title: "使用 Siphon 下载当前页嗅探到的 HLS 流 (.m3u8)",
-      contexts: ["page", "frame", "video"]
-    });
-
-    // 6. Current page downloadable resources batch scan
-    chrome.contextMenus.create({
-      id: "siphon-download-page",
-      title: "使用 Siphon 抓取当前页可下载资源",
-      contexts: ["page", "frame"]
+      id: "siphon-sniff-page",
+      title: "使用 Siphon 嗅探当前页资源（独立弹窗管理）",
+      contexts: ["page", "frame", "video", "audio"]
     });
   });
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.set({ enabled: true });
+  chrome.storage.local.set({ enabled: true, autoSniffToClient: true });
   registerContextMenus();
   notifySiphonAlive();
 });
@@ -198,7 +318,7 @@ function extractUrlsFromText(text) {
 
 async function scanTabResources(tabId, mode) {
   if (!tabId) return [];
-  const hlsSniffed = (tabHlsStreams.get(tabId) || []).slice();
+  const netSniffed = (tabSniffedStreams.get(tabId) || []).slice();
   let domItems = [];
   try {
     const results = await chrome.scripting.executeScript({
@@ -220,7 +340,14 @@ async function scanTabResources(tabId, mode) {
           }
           if (seen.has(url)) return;
           seen.add(url);
-          found.push({ url, kind, label: (label || "").trim().slice(0, 80) });
+          found.push({
+            url,
+            filename: null,
+            kind,
+            label: (label || "").trim().slice(0, 80) || null,
+            mime: null,
+            file_size: null
+          });
         };
 
         // Always collect <video> / <audio> and child <source>
@@ -257,7 +384,7 @@ async function scanTabResources(tabId, mode) {
         });
 
         if (scanMode === "all") {
-          // Also collect large images (>= 200x200) for popup sniffer
+          // Also collect large images (>= 200x200)
           document.querySelectorAll("img[src]").forEach((img) => {
             if ((img.naturalWidth || 0) >= 200 && (img.naturalHeight || 0) >= 200) {
               add(img.currentSrc || img.src, "image", img.alt || "");
@@ -265,7 +392,7 @@ async function scanTabResources(tabId, mode) {
           });
         }
 
-        return found.slice(0, 60);
+        return found.slice(0, 80);
       },
       args: [mode]
     });
@@ -274,21 +401,22 @@ async function scanTabResources(tabId, mode) {
     domItems = [];
   }
 
-  // Merge sniffed HLS streams at the top, deduplicated by URL
+  // Merge live network-sniffed HLS/video/audio streams at the top, deduplicated by URL
   const merged = [];
   const seen = new Set();
-  for (const item of [...hlsSniffed, ...domItems]) {
+  for (const item of [...netSniffed, ...domItems]) {
     if (!seen.has(item.url)) {
       seen.add(item.url);
       merged.push(item);
     }
   }
-  return merged.slice(0, 80);
+  return merged.slice(0, 120);
 }
 
 // Handle messages from popup.js
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || !msg.type) return;
+
   if (msg.type === "SCAN_ACTIVE_TAB") {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs && tabs[0];
@@ -297,10 +425,40 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       const items = await scanTabResources(tab.id, "all");
-      sendResponse({ ok: true, referrer: tab.url || "", items });
+      sendResponse({
+        ok: true,
+        pageTitle: tab.title || "",
+        referrer: tab.url || "",
+        items
+      });
     });
     return true;
   }
+
+  if (msg.type === "OPEN_SNIFF_WINDOW") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs && tabs[0];
+      if (!tab) {
+        sendResponse({ ok: false, count: 0 });
+        return;
+      }
+      const items = await scanTabResources(tab.id, "all");
+      const ok = await sendSniffToSiphon(tab, items, true);
+      flashBadge(ok ? String(items.length || "OK") : "!", ok ? "#22C55E" : "#E55353");
+      sendResponse({ ok, count: items.length });
+    });
+    return true;
+  }
+
+  if (msg.type === "LAUNCH_SIPHON") {
+    sendNativeToSiphon({ type: "launch" }).then((reply) => {
+      const ok = Boolean(reply && reply.ok);
+      flashBadge(ok ? "GO" : "!", ok ? "#22C55E" : "#E55353");
+      sendResponse({ ok, reply });
+    });
+    return true;
+  }
+
   if (msg.type === "SUBMIT_TO_SIPHON") {
     sendToSiphon({
       url: msg.url,
@@ -351,24 +509,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
 
-  if (id === "siphon-download-hls" && tab?.id) {
-    const hlsList = tabHlsStreams.get(tab.id) || [];
-    if (hlsList.length === 0) {
-      flashBadge("0", "#E5A93B");
-      return;
-    }
-    const ok = await sendToSiphon({
-      url: hlsList[0].url,
-      referrer,
-      filename: null,
-      mime: "application/vnd.apple.mpegurl",
-      fileSize: null,
-      silent: false
-    });
-    flashBadge(ok ? "HLS" : "!", ok ? "#22C55E" : "#E55353");
-    return;
-  }
-
   if (id === "siphon-download-media" || id === "siphon-download-media-silent") {
     const silent = id === "siphon-download-media-silent";
     let targetUrl = info.srcUrl;
@@ -411,54 +551,31 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       });
       flashBadge(ok ? "OK" : "!", ok ? "#22C55E" : "#E55353");
     } else {
-      let sent = 0;
-      for (const u of urls) {
-        const ok = await sendToSiphon({
-          url: u,
-          referrer,
-          filename: null,
-          mime: null,
-          fileSize: null,
-          silent: true
-        });
-        if (ok) sent += 1;
-      }
-      flashBadge(sent > 0 ? String(sent) : "!", sent > 0 ? "#22C55E" : "#E55353");
+      // Hand off multi-URL selection to Siphon's standalone Sniff Manager window!
+      const items = urls.map((u) => ({
+        url: u,
+        filename: null,
+        kind: u.toLowerCase().startsWith("magnet:?")
+          ? "magnet"
+          : u.toLowerCase().startsWith("ed2k://")
+            ? "ed2k"
+            : /\.m3u8(\?|$)/i.test(u)
+              ? "hls"
+              : "file",
+        label: null,
+        mime: null,
+        file_size: null
+      }));
+      const ok = await sendSniffToSiphon(tab || { title: "选中链接", url: referrer }, items, true);
+      flashBadge(ok ? String(items.length) : "!", ok ? "#22C55E" : "#E55353");
     }
     return;
   }
 
-  if (id === "siphon-download-page" && tab?.id) {
-    const resources = await scanTabResources(tab.id, "downloadable");
-    if (resources.length === 0) {
-      flashBadge("0", "#E5A93B");
-      return;
-    }
-    if (resources.length === 1) {
-      const ok = await sendToSiphon({
-        url: resources[0].url,
-        referrer,
-        filename: null,
-        mime: null,
-        fileSize: null,
-        silent: false
-      });
-      flashBadge(ok ? "OK" : "!", ok ? "#22C55E" : "#E55353");
-    } else {
-      let sent = 0;
-      for (const res of resources) {
-        const ok = await sendToSiphon({
-          url: res.url,
-          referrer,
-          filename: null,
-          mime: null,
-          fileSize: null,
-          silent: true
-        });
-        if (ok) sent += 1;
-      }
-      flashBadge(sent > 0 ? String(sent) : "!", sent > 0 ? "#22C55E" : "#E55353");
-    }
+  if (id === "siphon-sniff-page" && tab?.id) {
+    const resources = await scanTabResources(tab.id, "all");
+    const ok = await sendSniffToSiphon(tab, resources, true);
+    flashBadge(ok ? String(resources.length || "OK") : "!", ok ? "#22C55E" : "#E55353");
   }
 });
 
@@ -522,31 +639,73 @@ function basename(pathStr) {
 }
 
 async function sendToSiphon({ url, filename, referrer, mime, fileSize, silent = false }) {
+  const cookie = await getCookieHeader(url);
+  const payload = {
+    url,
+    filename: basename(filename),
+    referrer: referrer || null,
+    cookie: cookie || null,
+    user_agent: navigator.userAgent,
+    mime: mime || null,
+    file_size: typeof fileSize === "number" && fileSize > 0 ? fileSize : null,
+    silent: Boolean(silent)
+  };
+
+  // 1. Fast path: local HTTP bridge when Siphon is already running
   try {
-    const cookie = await getCookieHeader(url);
     const resp = await fetch(`${SIPHON_ENDPOINT}/api/capture`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Siphon-Client": CLIENT_VERSION
-      },
-      body: JSON.stringify({
-        url,
-        filename: basename(filename),
-        referrer: referrer || null,
-        cookie: cookie || null,
-        user_agent: navigator.userAgent,
-        mime: mime || null,
-        file_size: typeof fileSize === "number" && fileSize > 0 ? fileSize : null,
-        silent: Boolean(silent)
-      })
+      headers: bridgeHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
     });
-    if (!resp.ok) return false;
-    const data = await resp.json();
-    return Boolean(data && data.ok && data.captured);
+    if (resp.ok) {
+      const data = await resp.json();
+      return Boolean(data && data.ok && data.captured);
+    }
   } catch (_) {
-    return false;
+    // Client not running -> auto-launch via Native Messaging Host and deliver payload!
+    const nativeReply = await sendNativeToSiphon({
+      type: "browser_capture",
+      ...payload
+    });
+    return Boolean(nativeReply && nativeReply.ok);
   }
+  return false;
+}
+
+async function sendSniffToSiphon(tab, items, bringToFront = true) {
+  const pageUrl = (tab && tab.url) || "";
+  const cookie = await getCookieHeader(pageUrl);
+  const payload = {
+    page_title: (tab && tab.title) || null,
+    page_url: pageUrl || null,
+    referrer: pageUrl || null,
+    cookie: cookie || null,
+    user_agent: navigator.userAgent,
+    items: Array.isArray(items) ? items : [],
+    bring_to_front: Boolean(bringToFront)
+  };
+
+  // 1. Fast path: local HTTP bridge when Siphon is already running
+  try {
+    const resp = await fetch(`${SIPHON_ENDPOINT}/api/sniff`, {
+      method: "POST",
+      headers: bridgeHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      return Boolean(data && data.ok);
+    }
+  } catch (_) {
+    // Client not running -> auto-launch Siphon via Native Messaging Host and open Sniff Manager popup!
+    const nativeReply = await sendNativeToSiphon({
+      type: "browser_sniff",
+      ...payload
+    });
+    return Boolean(nativeReply && nativeReply.ok);
+  }
+  return false;
 }
 
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {

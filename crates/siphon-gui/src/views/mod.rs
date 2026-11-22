@@ -12,5 +12,6 @@ pub mod rules_view;
 pub mod scheduler_view;
 pub mod settings;
 pub mod sidebar;
+pub mod sniff_popup;
 pub mod task_list;
 pub mod titlebar;

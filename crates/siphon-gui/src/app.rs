@@ -3,7 +3,7 @@ use crate::icons::{IconKind, icon};
 use crate::state::{
     CaptureAction, CapturePopupState, ContextMenuState, DeleteConfirmState, DownloadPopupState,
     ExtInstallModalState, InputTarget, Message, NavSection, NewTaskModalState, RuleDraft,
-    ServerTestStatus, UpdateCheckStatus,
+    ServerTestStatus, SniffEntry, SniffFilterKind, SniffPopupState, UpdateCheckStatus,
 };
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, SiphonPalette, hairline_rule_style, modal_card_style,
@@ -32,14 +32,15 @@ use siphon_engine_ed2k::{
 use siphon_engine_hls::HlsEngine;
 use siphon_engine_http::{HttpEngine, check_for_updates};
 use siphon_platform_win::{
-    BrowserCapturePayload, DropEvent, FileIconKey, IpcCommand, TrayAction, TrayController,
-    WinHookEvent, apply_win11_backdrop, deploy_browser_extension, detect_installed_browsers,
-    execute_power_action, export_browser_extension_zip, extract_file_icons_async,
-    extract_urls_from_text, install_url_drop_target, install_window_hooks, is_autostart_enabled,
-    is_system_dark_mode, launch_browser_extensions_page, launch_silent_installer_update, open_file,
-    open_folder, open_url, read_clipboard_text, reveal_in_explorer, set_autostart,
-    show_window_native, spawn_browser_http_bridge, spawn_clipboard_monitor, spawn_ipc_server,
-    spawn_system_tray, write_clipboard_text,
+    BrowserCapturePayload, BrowserSniffPayload, DropEvent, FileIconKey, IpcCommand, TrayAction,
+    TrayController, WinHookEvent, apply_win11_backdrop, deploy_browser_extension,
+    detect_installed_browsers, execute_power_action, export_browser_extension_zip,
+    extract_file_icons_async, extract_urls_from_text, install_url_drop_target,
+    install_window_hooks, is_autostart_enabled, is_system_dark_mode,
+    launch_browser_extensions_page, launch_silent_installer_update, open_file, open_folder,
+    open_url, read_clipboard_text, register_native_messaging_host, register_siphon_protocol,
+    reveal_in_explorer, set_autostart, show_window_native, spawn_browser_http_bridge,
+    spawn_clipboard_monitor, spawn_ipc_server, spawn_system_tray, write_clipboard_text,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -136,6 +137,7 @@ pub struct SiphonApp {
     window_size: Size,
     cursor_pos: Point,
     capture_cursor_pos: Point,
+    sniff_cursor_pos: Point,
     active_input: InputTarget,
     context_menu: Option<ContextMenuState>,
     drag_hovering: bool,
@@ -169,6 +171,7 @@ pub struct SiphonApp {
     app_icon_handle: image::Handle,
     author_avatar_handle: image::Handle,
     capture_popup: Option<CapturePopupState>,
+    sniff_popup: Option<SniffPopupState>,
     download_popups: HashMap<window::Id, DownloadPopupState>,
     rule_draft: RuleDraft,
 
@@ -298,6 +301,7 @@ impl SiphonApp {
             window_size: Size::new(1340.0, 800.0),
             cursor_pos: Point::ORIGIN,
             capture_cursor_pos: Point::ORIGIN,
+            sniff_cursor_pos: Point::ORIGIN,
             active_input: InputTarget::QuickBar,
             context_menu: None,
             drag_hovering: false,
@@ -331,6 +335,7 @@ impl SiphonApp {
             app_icon_handle,
             author_avatar_handle,
             capture_popup: None,
+            sniff_popup: None,
             download_popups: HashMap::new(),
             rule_draft: RuleDraft {
                 save_dir_template: r"{base}\{domain}".to_string(),
@@ -376,9 +381,13 @@ impl SiphonApp {
         let init_icons = app.load_file_icons(initial_keys, false);
 
         // Keep previously deployed browser extension files in `%APPDATA%\Siphon\browser-extension`
-        // automatically synced to the latest bundled version on startup.
+        // automatically synced to the latest bundled version on startup, and always ensure the
+        // Native Messaging Host + `siphon://` protocol are registered so the browser can auto-launch Siphon.
         if app.manager.data_dir().join("browser-extension").is_dir() {
             let _ = deploy_browser_extension(app.manager.data_dir());
+        } else {
+            register_native_messaging_host(app.manager.data_dir(), &[]);
+            register_siphon_protocol();
         }
 
         let mut boot_tasks = vec![init_window, init_icons];
@@ -396,6 +405,11 @@ impl SiphonApp {
             .is_some_and(|p| p.window_id == Some(window_id))
         {
             return "Siphon 下载捕获".to_string();
+        }
+        if let Some(sniff) = &self.sniff_popup
+            && sniff.window_id == Some(window_id)
+        {
+            return format!("Siphon 资源嗅探 ({} 项)", sniff.items.len());
         }
         if let Some(dp) = self.download_popups.get(&window_id) {
             if let Some(task) = self.tasks.iter().find(|t| t.id == dp.task_id) {
@@ -444,6 +458,9 @@ impl SiphonApp {
             apply_win11_backdrop(hwnd, self.config.use_mica, p.is_dark);
         }
         if let Some(hwnd) = self.capture_popup.as_ref().and_then(|c| c.window_hwnd) {
+            apply_win11_backdrop(hwnd, self.config.use_mica, p.is_dark);
+        }
+        if let Some(hwnd) = self.sniff_popup.as_ref().and_then(|s| s.window_hwnd) {
             apply_win11_backdrop(hwnd, self.config.use_mica, p.is_dark);
         }
         for dp in self.download_popups.values() {
@@ -688,6 +705,151 @@ impl SiphonApp {
         Task::batch([win_task, icon_task, probe_task])
     }
 
+    /// Open or live-update the standalone Browser Resource Sniff Manager popup window.
+    fn open_or_update_sniff_popup(&mut self, payload: BrowserSniffPayload) -> Task<Message> {
+        let headers = payload.merged_headers();
+        let incoming_page_url = payload.page_url.clone().unwrap_or_default();
+        let incoming_page_title = payload.page_title.clone().unwrap_or_default();
+        let has_non_image = payload
+            .items
+            .iter()
+            .any(|it| !it.kind.eq_ignore_ascii_case("image"));
+
+        let build_entry = |id: usize, it: siphon_platform_win::SniffedResourceItem| -> SniffEntry {
+            let parsed = url::Url::parse(&it.url).ok();
+            let raw_name = it
+                .filename
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| infer_filename_from_raw_url(&it.url, parsed.as_ref()));
+            let filename = sanitize_filename(&raw_name);
+            let kind = if it.kind.trim().is_empty() {
+                "file".to_string()
+            } else {
+                it.kind.trim().to_ascii_lowercase()
+            };
+            let selected = if has_non_image {
+                kind != "image"
+            } else {
+                true
+            };
+            SniffEntry {
+                id,
+                url: it.url,
+                filename,
+                kind,
+                label: it.label.unwrap_or_default(),
+                mime: it.mime,
+                file_size: it.file_size,
+                selected,
+            }
+        };
+
+        if let Some(existing) = &mut self.sniff_popup {
+            let same_page = !incoming_page_url.is_empty()
+                && existing.page_url == incoming_page_url;
+            if !incoming_page_title.is_empty() {
+                existing.page_title = incoming_page_title;
+            }
+            if !headers.is_empty() {
+                existing.headers = headers;
+            }
+            if same_page {
+                for it in payload.items {
+                    if let Some(slot) = existing.items.iter_mut().find(|e| e.url == it.url) {
+                        if slot.file_size.is_none() && it.file_size.is_some() {
+                            slot.file_size = it.file_size;
+                        }
+                        if slot.mime.is_none() && it.mime.is_some() {
+                            slot.mime = it.mime;
+                        }
+                    } else {
+                        let id = existing.next_entry_id;
+                        existing.next_entry_id += 1;
+                        let entry = build_entry(id, it);
+                        if matches!(entry.kind.as_str(), "hls" | "video" | "audio") {
+                            existing.items.insert(0, entry);
+                        } else {
+                            existing.items.push(entry);
+                        }
+                    }
+                }
+            } else {
+                existing.page_url = incoming_page_url;
+                existing.filter = SniffFilterKind::All;
+                existing.search.clear();
+                existing.items.clear();
+                for it in payload.items {
+                    if existing.items.iter().any(|e| e.url == it.url) {
+                        continue;
+                    }
+                    let id = existing.next_entry_id;
+                    existing.next_entry_id += 1;
+                    existing.items.push(build_entry(id, it));
+                }
+            }
+
+            if payload.bring_to_front {
+                if let Some(hwnd) = existing.window_hwnd {
+                    show_window_native(hwnd);
+                }
+                if let Some(wid) = existing.window_id {
+                    return window::gain_focus(wid);
+                }
+            }
+            return Task::none();
+        }
+
+        let mut entries = Vec::new();
+        let mut next_id = 1usize;
+        for it in payload.items {
+            if entries.iter().any(|e: &SniffEntry| e.url == it.url) {
+                continue;
+            }
+            entries.push(build_entry(next_id, it));
+            next_id += 1;
+        }
+
+        let (rgba, w, h) = siphon_platform_win::generate_siphon_icon_rgba();
+        let app_icon = window::icon::from_rgba(rgba, w, h).ok();
+        let settings = window::Settings {
+            size: iced::Size::new(740.0, 540.0),
+            min_size: Some(iced::Size::new(640.0, 440.0)),
+            position: window::Position::Centered,
+            decorations: false,
+            transparent: true,
+            resizable: true,
+            visible: true,
+            level: window::Level::AlwaysOnTop,
+            exit_on_close_request: false,
+            icon: app_icon,
+            ..Default::default()
+        };
+        let (wid, open_task) = window::open(settings);
+        self.sniff_popup = Some(SniffPopupState {
+            window_id: Some(wid),
+            window_hwnd: None,
+            page_title: incoming_page_title,
+            page_url: incoming_page_url,
+            headers,
+            items: entries,
+            next_entry_id: next_id,
+            filter: SniffFilterKind::All,
+            search: String::new(),
+            save_dir: self.config.default_save_dir.to_string_lossy().to_string(),
+        });
+        self.context_menu = None;
+
+        open_task.then(|id| {
+            Task::batch([
+                Task::done(Message::SniffWindowOpened(id)),
+                window::raw_id::<()>(id).map(Message::SniffWindowRawId),
+                window::gain_focus(id),
+            ])
+        })
+    }
+
     /// Open or focus the standalone download progress detail popup window for `task_id`.
     fn open_download_detail_popup(&mut self, task_id: TaskId) -> Task<Message> {
         if let Some(existing) = self
@@ -740,6 +902,13 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     return window::raw_id::<()>(id).map(Message::CaptureWindowRawId);
+                }
+                if self
+                    .sniff_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    return window::raw_id::<()>(id).map(Message::SniffWindowRawId);
                 }
                 if self.download_popups.contains_key(&id) {
                     return window::raw_id::<()>(id)
@@ -834,6 +1003,12 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     self.capture_cursor_pos = pos;
+                } else if self
+                    .sniff_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    self.sniff_cursor_pos = pos;
                 } else {
                     self.cursor_pos = pos;
                 }
@@ -845,6 +1020,14 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     self.capture_popup = None;
+                    return window::close(id);
+                }
+                if self
+                    .sniff_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    self.sniff_popup = None;
                     return window::close(id);
                 }
                 if self.download_popups.remove(&id).is_some() {
@@ -863,6 +1046,13 @@ impl SiphonApp {
                     .is_some_and(|p| p.window_id == Some(id))
                 {
                     self.capture_popup = None;
+                }
+                if self
+                    .sniff_popup
+                    .as_ref()
+                    .is_some_and(|p| p.window_id == Some(id))
+                {
+                    self.sniff_popup = None;
                 }
                 self.download_popups.remove(&id);
             }
@@ -922,6 +1112,8 @@ impl SiphonApp {
                     self.ext_install_modal = None;
                 } else if self.capture_popup.is_some() {
                     return self.update(Message::CaptureCancel);
+                } else if self.sniff_popup.is_some() {
+                    return self.update(Message::SniffClose);
                 } else if self.delete_confirm.is_some() {
                     self.delete_confirm = None;
                 } else if self.modal.open {
@@ -944,6 +1136,8 @@ impl SiphonApp {
                     InputTarget::CaptureFilename | InputTarget::CaptureSaveDir
                 ) {
                     self.capture_cursor_pos
+                } else if matches!(target, InputTarget::SniffSearch | InputTarget::SniffSaveDir) {
+                    self.sniff_cursor_pos
                 } else {
                     self.cursor_pos
                 };
@@ -953,11 +1147,17 @@ impl SiphonApp {
                 self.context_menu = None;
             }
             Message::PasteIntoActiveInput => {
-                let target = if self.capture_popup.is_some()
+                let target = if (self.capture_popup.is_some()
                     && matches!(
                         self.active_input,
                         InputTarget::CaptureFilename | InputTarget::CaptureSaveDir
-                    ) {
+                    ))
+                    || (self.sniff_popup.is_some()
+                        && matches!(
+                            self.active_input,
+                            InputTarget::SniffSearch | InputTarget::SniffSaveDir
+                        ))
+                {
                     self.active_input
                 } else if self.modal.open {
                     match self.active_input {
@@ -1310,6 +1510,14 @@ impl SiphonApp {
                         Message::TaskOpFinished,
                     );
                 }
+                IpcCommand::BrowserSniff(payload) => {
+                    self.browser_ext_connected = true;
+                    return self.open_or_update_sniff_popup(payload);
+                }
+                IpcCommand::ExtensionHandshake { extension_id } => {
+                    self.browser_ext_connected = true;
+                    register_native_messaging_host(self.manager.data_dir(), &[extension_id]);
+                }
                 IpcCommand::Ping => {
                     self.browser_ext_connected = true;
                 }
@@ -1556,6 +1764,198 @@ impl SiphonApp {
                     self.toast = Some(format!("创建下载任务失败: {e}"));
                 }
             },
+
+            // Standalone Browser Resource Sniff Manager Window
+            Message::SniffWindowOpened(id) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.window_id = Some(id);
+                }
+                return window::raw_id::<()>(id).map(Message::SniffWindowRawId);
+            }
+            Message::SniffWindowRawId(hwnd) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.window_hwnd = Some(hwnd);
+                }
+                self.apply_backdrop_now();
+                show_window_native(hwnd);
+                if let Some(shared) = SHARED.get() {
+                    install_window_hooks(hwnd, shared.hook_tx.clone());
+                }
+            }
+            Message::SniffDragWindow => {
+                if let Some(wid) = self.sniff_popup.as_ref().and_then(|s| s.window_id) {
+                    return window::drag(wid);
+                }
+            }
+            Message::SniffClose => {
+                self.context_menu = None;
+                if let Some(s) = self.sniff_popup.take()
+                    && let Some(wid) = s.window_id
+                {
+                    return window::close(wid);
+                }
+            }
+            Message::SniffSetFilter(f) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.filter = f;
+                }
+            }
+            Message::SniffSearchChanged(v) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.search = v;
+                }
+            }
+            Message::SniffToggleItem(entry_id) => {
+                if let Some(s) = &mut self.sniff_popup
+                    && let Some(item) = s.items.iter_mut().find(|e| e.id == entry_id)
+                {
+                    item.selected = !item.selected;
+                }
+            }
+            Message::SniffSelectAllVisible(select) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    let visible_ids: HashSet<usize> = views::sniff_popup::visible_entries(s)
+                        .into_iter()
+                        .map(|e| e.id)
+                        .collect();
+                    for item in &mut s.items {
+                        if visible_ids.contains(&item.id) {
+                            item.selected = select;
+                        }
+                    }
+                }
+            }
+            Message::SniffRemoveItem(entry_id) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.items.retain(|e| e.id != entry_id);
+                }
+            }
+            Message::SniffClearAll => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.items.clear();
+                }
+            }
+            Message::SniffSaveDirChanged(v) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.save_dir = v;
+                }
+            }
+            Message::SniffBrowseDir => {
+                let start = self
+                    .sniff_popup
+                    .as_ref()
+                    .map(|s| PathBuf::from(&s.save_dir))
+                    .unwrap_or_else(|| self.config.default_save_dir.clone());
+                return Task::perform(
+                    async move {
+                        let mut dlg = rfd::AsyncFileDialog::new();
+                        if start.is_dir() {
+                            dlg = dlg.set_directory(start);
+                        }
+                        dlg.pick_folder().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::SniffDirPicked,
+                );
+            }
+            Message::SniffDirPicked(Some(dir)) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.save_dir = dir.to_string_lossy().to_string();
+                }
+            }
+            Message::SniffDirPicked(None) => {}
+            Message::SniffDownloadSingle(entry_id) => {
+                if let Some(s) = &mut self.sniff_popup
+                    && let Some(idx) = s.items.iter().position(|e| e.id == entry_id)
+                {
+                    let entry = s.items.remove(idx);
+                    let headers = s.headers.clone();
+                    let save_dir = {
+                        let d = s.save_dir.trim();
+                        if d.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(d))
+                        }
+                    };
+                    let req = NewTaskRequest {
+                        url: entry.url,
+                        filename: Some(entry.filename.clone()),
+                        save_dir,
+                        max_connections: None,
+                        speed_limit_bps: None,
+                        headers,
+                        checksum: None,
+                        source: TaskSource::Browser,
+                        auto_start: true,
+                    };
+                    self.toast = Some(format!("已从嗅探窗开始下载: {}", entry.filename));
+                    let mgr = Arc::clone(&self.manager);
+                    return Task::perform(
+                        async move { mgr.add_task(req).await.map_err(|e| e.to_string()) },
+                        Message::CaptureStartedWithDialog,
+                    );
+                }
+            }
+            Message::SniffDownloadSelected(auto_start) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    let chosen: Vec<SniffEntry> =
+                        s.items.iter().filter(|e| e.selected).cloned().collect();
+                    if chosen.is_empty() {
+                        return Task::none();
+                    }
+                    let count = chosen.len();
+                    let headers = s.headers.clone();
+                    let save_dir = {
+                        let d = s.save_dir.trim();
+                        if d.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(d))
+                        }
+                    };
+                    s.items.retain(|e| !e.selected);
+                    let close_win = if s.items.is_empty() {
+                        self.sniff_popup.take().and_then(|st| st.window_id)
+                    } else {
+                        None
+                    };
+                    self.toast = Some(format!(
+                        "已从资源嗅探窗提交 {count} 个任务（{}）",
+                        if auto_start { "开始下载" } else { "加入暂停队列" }
+                    ));
+                    let mgr = Arc::clone(&self.manager);
+                    let submit_task = Task::perform(
+                        async move {
+                            let mut last_err = None;
+                            for entry in chosen {
+                                let req = NewTaskRequest {
+                                    url: entry.url,
+                                    filename: Some(entry.filename),
+                                    save_dir: save_dir.clone(),
+                                    max_connections: None,
+                                    speed_limit_bps: None,
+                                    headers: headers.clone(),
+                                    checksum: None,
+                                    source: TaskSource::Browser,
+                                    auto_start,
+                                };
+                                if let Err(e) = mgr.add_task(req).await {
+                                    last_err = Some(e.to_string());
+                                }
+                            }
+                            match last_err {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            }
+                        },
+                        Message::TaskOpFinished,
+                    );
+                    if let Some(wid) = close_win {
+                        return Task::batch([window::close(wid), submit_task]);
+                    }
+                    return submit_task;
+                }
+            }
             Message::OpenTaskDetailPopup(task_id) => {
                 return self.open_download_detail_popup(task_id);
             }
@@ -3401,6 +3801,16 @@ impl SiphonApp {
                 .as_ref()
                 .map(|p| p.save_dir.as_str())
                 .unwrap_or(""),
+            InputTarget::SniffSearch => self
+                .sniff_popup
+                .as_ref()
+                .map(|s| s.search.as_str())
+                .unwrap_or(""),
+            InputTarget::SniffSaveDir => self
+                .sniff_popup
+                .as_ref()
+                .map(|s| s.save_dir.as_str())
+                .unwrap_or(""),
         }
     }
 
@@ -3465,6 +3875,16 @@ impl SiphonApp {
                 if let Some(popup) = &mut self.capture_popup {
                     popup.save_dir = val;
                     popup.save_dir_edited_by_user = true;
+                }
+            }
+            InputTarget::SniffSearch => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.search = val;
+                }
+            }
+            InputTarget::SniffSaveDir => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.save_dir = val;
                 }
             }
         }
@@ -3587,6 +4007,8 @@ impl SiphonApp {
             InputTarget::CaptureFilename | InputTarget::CaptureSaveDir
         ) {
             (620.0f32, 404.0f32)
+        } else if matches!(target, InputTarget::SniffSearch | InputTarget::SniffSaveDir) {
+            (740.0f32, 540.0f32)
         } else {
             (self.window_size.width, self.window_size.height)
         };
@@ -3763,6 +4185,23 @@ impl SiphonApp {
                 return stack![popup_base, menu_layer].into();
             }
             return popup_base;
+        }
+
+        // Render standalone Browser Resource Sniff Manager window when `window_id` belongs to `sniff_popup`
+        if let Some(sniff) = &self.sniff_popup
+            && sniff.window_id == Some(window_id)
+        {
+            let sniff_base = views::sniff_popup::view(sniff, palette);
+            if let Some(menu) = self.context_menu
+                && matches!(
+                    menu.target,
+                    InputTarget::SniffSearch | InputTarget::SniffSaveDir
+                )
+            {
+                let menu_layer = self.view_context_menu(menu, palette);
+                return stack![sniff_base, menu_layer].into();
+            }
+            return sniff_base;
         }
 
         // Render standalone download progress detail window when `window_id` belongs to `download_popups`
@@ -4015,7 +4454,10 @@ impl SiphonApp {
         if let Some(menu) = self.context_menu
             && !matches!(
                 menu.target,
-                InputTarget::CaptureFilename | InputTarget::CaptureSaveDir
+                InputTarget::CaptureFilename
+                    | InputTarget::CaptureSaveDir
+                    | InputTarget::SniffSearch
+                    | InputTarget::SniffSaveDir
             )
         {
             let menu_layer = self.view_context_menu(menu, palette);

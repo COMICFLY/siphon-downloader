@@ -329,22 +329,13 @@ pub fn detect_installed_browsers() -> Vec<DetectedBrowser> {
     found
 }
 
-/// Deploy/update the built-in Chrome/Edge MV3 extension (including PNG icons) to
-/// `%APPDATA%\Siphon\browser-extension` and register Native Messaging Hosts in HKCU.
-pub fn deploy_browser_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
-    let ext_dir = normalize_win_path(&data_dir.join("browser-extension"));
-    let icons_dir = ext_dir.join("icons");
-    std::fs::create_dir_all(&icons_dir)?;
-    std::fs::write(ext_dir.join("manifest.json"), EXT_MANIFEST_JSON)?;
-    std::fs::write(ext_dir.join("background.js"), EXT_BACKGROUND_JS)?;
-    std::fs::write(ext_dir.join("popup.html"), EXT_POPUP_HTML)?;
-    std::fs::write(ext_dir.join("popup.js"), EXT_POPUP_JS)?;
-    std::fs::write(icons_dir.join("icon-16.png"), EXT_ICON_16_PNG)?;
-    std::fs::write(icons_dir.join("icon-32.png"), EXT_ICON_32_PNG)?;
-    std::fs::write(icons_dir.join("icon-48.png"), EXT_ICON_48_PNG)?;
-    std::fs::write(icons_dir.join("icon-128.png"), EXT_ICON_128_PNG)?;
+/// Deterministic Chromium Extension ID derived from `browser-extension/manifest.json`'s `"key"`.
+pub const SIPHON_EXTENSION_ID: &str = "imcbffndjiifaihgngccjdohhcjkknim";
 
-    // Register Native Messaging host manifest in HKCU for Edge, Chrome, Brave & Vivaldi
+/// Register the Native Messaging Host manifest (`com.siphon.downloader.json`) and HKCU registry
+/// entries for Edge, Chrome, Brave & Vivaldi so the browser extension can auto-launch Siphon when
+/// the desktop client is not running.
+pub fn register_native_messaging_host(data_dir: &Path, extra_ext_ids: &[String]) {
     let host_dir = normalize_win_path(&data_dir.join("native-host"));
     let _ = std::fs::create_dir_all(&host_dir);
     let host_exe = std::env::current_exe()
@@ -352,19 +343,44 @@ pub fn deploy_browser_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
         .and_then(|p| p.parent().map(|d| d.join("siphon-native-host.exe")))
         .unwrap_or_else(|| PathBuf::from("siphon-native-host.exe"));
     let host_manifest_path = host_dir.join("com.siphon.downloader.json");
-    let escaped_exe = host_exe.to_string_lossy().replace('\\', "\\\\");
-    let host_manifest = format!(
-        r#"{{
-  "name": "com.siphon.downloader",
-  "description": "Siphon Native Messaging Host",
-  "path": "{escaped_exe}",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://*/"
-  ]
-}}"#
-    );
-    let _ = std::fs::write(&host_manifest_path, host_manifest);
+
+    // Preserve any valid previously registered extension IDs alongside the fixed deterministic ID
+    let mut origins: Vec<String> = vec![format!("chrome-extension://{SIPHON_EXTENSION_ID}/")];
+    if let Ok(existing_raw) = std::fs::read_to_string(&host_manifest_path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&existing_raw)
+        && let Some(arr) = val.get("allowed_origins").and_then(|v| v.as_array())
+    {
+        for item in arr {
+            if let Some(s) = item.as_str()
+                && s.starts_with("chrome-extension://")
+                && s.ends_with('/')
+                && !s.contains('*')
+                && !origins.iter().any(|o| o == s)
+            {
+                origins.push(s.to_string());
+            }
+        }
+    }
+    for id in extra_ext_ids {
+        let trimmed = id.trim();
+        if trimmed.len() == 32 && trimmed.bytes().all(|b| (b'a'..=b'p').contains(&b)) {
+            let origin = format!("chrome-extension://{trimmed}/");
+            if !origins.iter().any(|o| o == &origin) {
+                origins.push(origin);
+            }
+        }
+    }
+
+    let manifest_json = serde_json::json!({
+        "name": "com.siphon.downloader",
+        "description": "Siphon Native Messaging Host",
+        "path": host_exe.to_string_lossy().to_string(),
+        "type": "stdio",
+        "allowed_origins": origins,
+    });
+    if let Ok(pretty) = serde_json::to_string_pretty(&manifest_json) {
+        let _ = std::fs::write(&host_manifest_path, pretty);
+    }
 
     #[cfg(windows)]
     {
@@ -410,6 +426,86 @@ pub fn deploy_browser_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
             }
         }
     }
+}
+
+/// Register the `siphon://` custom URL protocol in HKCU so browsers or links can wake Siphon.
+pub fn register_siphon_protocol() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+            RegCreateKeyExW, RegSetValueExW,
+        };
+        use windows::core::PCWSTR;
+
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let set_sz = |subkey: &str, name: Option<&str>, value: &str| {
+            let wide_key: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide_val: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+            let val_bytes = unsafe {
+                std::slice::from_raw_parts(wide_val.as_ptr().cast::<u8>(), wide_val.len() * 2)
+            };
+            unsafe {
+                let mut hkey = HKEY::default();
+                if RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(wide_key.as_ptr()),
+                    None,
+                    None,
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_SET_VALUE,
+                    None,
+                    &mut hkey,
+                    None,
+                )
+                .is_ok()
+                {
+                    if let Some(n) = name {
+                        let wn: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
+                        let _ = RegSetValueExW(hkey, PCWSTR(wn.as_ptr()), None, REG_SZ, Some(val_bytes));
+                    } else {
+                        let _ = RegSetValueExW(hkey, None, None, REG_SZ, Some(val_bytes));
+                    }
+                    let _ = RegCloseKey(hkey);
+                }
+            }
+        };
+
+        let exe_str = normalize_win_path(&exe).to_string_lossy().to_string();
+        set_sz(r"Software\Classes\siphon", None, "URL:Siphon Downloader Protocol");
+        set_sz(r"Software\Classes\siphon", Some("URL Protocol"), "");
+        set_sz(
+            r"Software\Classes\siphon\DefaultIcon",
+            None,
+            &format!(r#""{exe_str}",0"#),
+        );
+        set_sz(
+            r"Software\Classes\siphon\shell\open\command",
+            None,
+            &format!(r#""{exe_str}" "%1""#),
+        );
+    }
+}
+
+/// Deploy/update the built-in Chrome/Edge MV3 extension (including PNG icons) to
+/// `%APPDATA%\Siphon\browser-extension` and register Native Messaging Hosts in HKCU.
+pub fn deploy_browser_extension(data_dir: &Path) -> std::io::Result<PathBuf> {
+    let ext_dir = normalize_win_path(&data_dir.join("browser-extension"));
+    let icons_dir = ext_dir.join("icons");
+    std::fs::create_dir_all(&icons_dir)?;
+    std::fs::write(ext_dir.join("manifest.json"), EXT_MANIFEST_JSON)?;
+    std::fs::write(ext_dir.join("background.js"), EXT_BACKGROUND_JS)?;
+    std::fs::write(ext_dir.join("popup.html"), EXT_POPUP_HTML)?;
+    std::fs::write(ext_dir.join("popup.js"), EXT_POPUP_JS)?;
+    std::fs::write(icons_dir.join("icon-16.png"), EXT_ICON_16_PNG)?;
+    std::fs::write(icons_dir.join("icon-32.png"), EXT_ICON_32_PNG)?;
+    std::fs::write(icons_dir.join("icon-48.png"), EXT_ICON_48_PNG)?;
+    std::fs::write(icons_dir.join("icon-128.png"), EXT_ICON_128_PNG)?;
+
+    register_native_messaging_host(data_dir, &[]);
+    register_siphon_protocol();
 
     Ok(ext_dir)
 }
