@@ -1,10 +1,12 @@
 pub mod file_io;
 pub mod probe;
+pub mod sniffer;
 pub mod splitter;
 pub mod updater;
 pub mod verifier;
 pub mod worker;
 
+pub use sniffer::{SniffedWebItem, extract_resources_from_html, probe_urls_sizes, sniff_webpage_url};
 pub use updater::{
     GITHUB_RELEASES_URL, GITHUB_REPO_URL, GITHUB_USER_URL, UpdateInfo, check_for_updates,
 };

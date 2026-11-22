@@ -39,8 +39,8 @@ sniffToggleEl.addEventListener("change", () => {
 function renderSniffDisabledState() {
   resCount.textContent = "已关闭";
   sniffSummary.innerHTML =
-    '<span class="pill">嗅探默认关闭（仅下载时拉起客户端）；开启上方开关即可自动捕获流媒体</span>';
-  openSniffBtn.textContent = "手动扫描并交由 Siphon 弹窗管理";
+    '<span class="pill">嗅探默认关闭（仅下载时拉起客户端）；开启上方开关或点下方按钮可立即深度扫描当前页（含内嵌 iframe 与已加载流）</span>';
+  openSniffBtn.textContent = "立即深度扫描并打开选择性下载窗";
 }
 
 async function checkStatus() {
@@ -87,8 +87,8 @@ function loadPageSummary() {
     const items = resp.items || [];
     resCount.textContent = `${items.length} 项`;
     if (items.length === 0) {
-      sniffSummary.innerHTML = '<span class="pill">暂未捕获资源，播放音视频后将自动推送到客户端弹窗</span>';
-      openSniffBtn.textContent = "打开 Siphon 资源嗅探管理窗";
+      sniffSummary.innerHTML = '<span class="pill">暂未捕获资源，播放音视频后将自动推送到选择性下载窗</span>';
+      openSniffBtn.textContent = "打开 Siphon 选择性下载窗";
       return;
     }
 
@@ -110,19 +110,19 @@ function loadPageSummary() {
       span.textContent = txt;
       sniffSummary.appendChild(span);
     };
-    if (counts.hls > 0) addPill(`HLS 流 ${counts.hls}`, "hls");
+    if (counts.hls > 0) addPill(`HLS/DASH ${counts.hls}`, "hls");
     if (counts.video > 0) addPill(`视频 ${counts.video}`, "media");
     if (counts.audio > 0) addPill(`音频 ${counts.audio}`, "media");
     if (counts.file > 0) addPill(`文件 ${counts.file}`);
     if (counts.p2p > 0) addPill(`磁力/eD2k ${counts.p2p}`, "p2p");
     if (counts.image > 0) addPill(`图片 ${counts.image}`);
 
-    openSniffBtn.textContent = `在 Siphon 独立弹窗管理 (${items.length} 项)`;
+    openSniffBtn.textContent = `在 Siphon 选择性下载窗勾选 (${items.length} 项)`;
   });
 }
 
 openSniffBtn.addEventListener("click", () => {
-  openSniffBtn.textContent = "正在打开 Siphon 嗅探管理窗...";
+  openSniffBtn.textContent = "正在打开 Siphon 选择性下载窗...";
   openSniffBtn.disabled = true;
   chrome.runtime.sendMessage({ type: "OPEN_SNIFF_WINDOW" }, (resp) => {
     if (resp && resp.ok) {

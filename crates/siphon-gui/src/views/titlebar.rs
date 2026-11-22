@@ -3,7 +3,8 @@ use crate::icons::{IconKind, icon};
 use crate::state::{InputTarget, Message};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette, hairline_rule_style,
-    panel_style, primary_btn_style, seamless_input_style, subtle_btn_style, window_ctrl_btn_style,
+    outline_btn_style, panel_style, primary_btn_style, seamless_input_style, subtle_btn_style,
+    window_ctrl_btn_style,
 };
 use iced::widget::{button, container, mouse_area, row, rule, space, text, text_input};
 use iced::{Alignment, Element, Length};
@@ -133,6 +134,30 @@ pub fn view<'a>(
     .style(primary_btn_style(palette))
     .on_press(Message::OpenNewTaskModal(None));
 
+    let sniff_btn = button(
+        container(
+            row![
+                icon(IconKind::Search, 13.0, palette.accent),
+                text(if strings.lang == siphon_core::Language::ZhCn {
+                    "资源嗅探"
+                } else {
+                    "Sniff"
+                })
+                .size(13)
+                .font(FONT_MEDIUM)
+                .wrapping(text::Wrapping::None),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .height(Length::Fill)
+        .align_y(Alignment::Center),
+    )
+    .height(Length::Fixed(34.0))
+    .padding([0, 12])
+    .style(outline_btn_style(palette))
+    .on_press(Message::OpenEmptySniffPopup);
+
     // Only drag_spacer uses Length::Fill so right-side window controls NEVER stretch in fullscreen!
     let drag_spacer = mouse_area(container(space()).width(Length::Fill).height(Length::Fill))
         .on_press(Message::DragWindow)
@@ -189,7 +214,7 @@ pub fn view<'a>(
     .spacing(2)
     .align_y(Alignment::Center);
 
-    let main_header_bay = row![search_shell, new_btn, drag_spacer, right_controls]
+    let main_header_bay = row![search_shell, new_btn, sniff_btn, drag_spacer, right_controls]
         .spacing(12)
         .padding(iced::Padding {
             top: 0.0,

@@ -3,7 +3,7 @@ use siphon_core::{
     AppConfig, AutomationRule, DownloadTask, ExternalPlugin, FileCategory, Language, ListDensity,
     ProbePreview, QueueCompleteAction, TaskEvent, TaskId, TaskSource, ThemeMode,
 };
-use siphon_engine_http::UpdateInfo;
+use siphon_engine_http::{SniffedWebItem, UpdateInfo};
 use siphon_platform_win::{
     DetectedBrowser, DropEvent, FileIconBitmap, FileIconKey, IpcCommand, TrayAction, WinHookEvent,
 };
@@ -90,6 +90,7 @@ pub enum InputTarget {
     Ed2kNewServerPort,
     CaptureFilename,
     CaptureSaveDir,
+    SniffPageUrl,
     SniffSearch,
     SniffSaveDir,
 }
@@ -178,12 +179,17 @@ pub struct SniffPopupState {
     pub window_hwnd: Option<u64>,
     pub page_title: String,
     pub page_url: String,
+    pub page_url_input: String,
+    pub sniffing_page: bool,
+    pub probing_sizes: bool,
+    pub sniff_error: Option<String>,
     pub headers: BTreeMap<String, String>,
     pub items: Vec<SniffEntry>,
     pub next_entry_id: usize,
     pub filter: SniffFilterKind,
     pub search: String,
     pub save_dir: String,
+    pub connections: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,20 +279,28 @@ pub enum Message {
     CaptureStartedWithDialog(std::result::Result<DownloadTask, String>),
     CaptureCancel,
 
-    // Standalone Browser Resource Sniff Manager Window
+    // Standalone Browser Resource Sniff & Selective Download Window
+    OpenEmptySniffPopup,
     SniffWindowOpened(window::Id),
     SniffWindowRawId(u64),
     SniffDragWindow,
     SniffClose,
+    SniffPageUrlChanged(String),
+    SniffFetchPageUrl,
+    SniffFetchPageFinished(std::result::Result<(String, String, Vec<SniffedWebItem>), String>),
     SniffSetFilter(SniffFilterKind),
     SniffSearchChanged(String),
     SniffToggleItem(usize),
     SniffSelectAllVisible(bool),
+    SniffInvertSelection,
+    SniffProbeSizes,
+    SniffProbeSizesFinished(Vec<(String, Option<u64>)>),
     SniffRemoveItem(usize),
     SniffClearAll,
     SniffSaveDirChanged(String),
     SniffBrowseDir,
     SniffDirPicked(Option<PathBuf>),
+    SniffConnectionsChanged(f32),
     SniffDownloadSingle(usize),
     SniffDownloadSelected(bool),
 

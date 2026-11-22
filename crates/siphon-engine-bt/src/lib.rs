@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use librqbit::api::TorrentIdOrHash;
+use librqbit::dht::DhtPersistenceConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig,
-    ListenerOptions, PeerConnectionOptions, Session, SessionOptions,
+    ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionOptions,
 };
 use percent_encoding::percent_decode_str;
 use siphon_core::{
@@ -12,18 +14,134 @@ use siphon_core::{
 };
 use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use url::Url;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionFingerprint {
+    enable_dht: bool,
+    enable_lsd: bool,
+    enable_upnp: bool,
+    disable_trackers: bool,
+    listen_port: u16,
+    peer_connect_timeout_secs: u64,
+    max_peers_per_torrent: usize,
+    proxy_url: Option<String>,
+}
+
+impl SessionFingerprint {
+    fn from_cfg(bt: &BtConfig, proxy_url: Option<&str>) -> Self {
+        Self {
+            enable_dht: bt.enable_dht,
+            enable_lsd: bt.enable_lsd,
+            enable_upnp: bt.enable_upnp,
+            disable_trackers: bt.disable_trackers,
+            listen_port: bt.listen_port,
+            peer_connect_timeout_secs: bt.peer_connect_timeout_secs,
+            max_peers_per_torrent: bt.max_peers_per_torrent,
+            proxy_url: proxy_url
+                .map(str::trim)
+                .filter(|p| p.to_ascii_lowercase().starts_with("socks5://"))
+                .map(str::to_string),
+        }
+    }
+}
+
+struct WarmSession {
+    fingerprint: SessionFingerprint,
+    session: Arc<Session>,
+}
+
 /// Pure-Rust BitTorrent / Magnet download engine powered by `librqbit`,
-/// with full custom tracker injection, subscription sync, DHT/LSD/UPnP and port controls.
-#[derive(Debug, Default)]
-pub struct BitTorrentEngine;
+/// using a long-lived pre-warmed shared session with persisted DHT routing table,
+/// TCP+uTP listeners, and full custom tracker injection for instant task startup.
+pub struct BitTorrentEngine {
+    data_dir: Option<PathBuf>,
+    warm: Mutex<Option<WarmSession>>,
+}
+
+impl std::fmt::Debug for BitTorrentEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitTorrentEngine")
+            .field("data_dir", &self.data_dir)
+            .finish()
+    }
+}
+
+impl Default for BitTorrentEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BitTorrentEngine {
     pub fn new() -> Self {
-        Self
+        Self {
+            data_dir: None,
+            warm: Mutex::new(None),
+        }
+    }
+
+    /// Create a `BitTorrentEngine` that persists its DHT routing table under `data_dir`.
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir: Some(data_dir),
+            warm: Mutex::new(None),
+        }
+    }
+
+    /// Pre-warm the shared BitTorrent session & DHT routing table in the background at app startup
+    /// so subsequent Magnet / `.torrent` downloads attach in milliseconds instead of cold-bootstrapping.
+    pub async fn warmup(&self, bt: &BtConfig, default_output_dir: &Path, proxy_url: Option<&str>) {
+        if !bt.enable_dht && bt.disable_trackers {
+            return;
+        }
+        let _ = self
+            .get_or_create_session(bt, default_output_dir, proxy_url)
+            .await;
+    }
+
+    async fn get_or_create_session(
+        &self,
+        bt: &BtConfig,
+        fallback_dir: &Path,
+        proxy_url: Option<&str>,
+    ) -> Result<(Arc<Session>, bool)> {
+        let fp = SessionFingerprint::from_cfg(bt, proxy_url);
+        let mut guard = self.warm.lock().await;
+        if let Some(existing) = guard.as_ref()
+            && existing.fingerprint == fp
+        {
+            return Ok((Arc::clone(&existing.session), true));
+        }
+
+        // Replace old session cleanly if BT network settings changed
+        if let Some(old) = guard.take() {
+            old.session.stop().await;
+        }
+
+        let base_dir = self
+            .data_dir
+            .as_deref()
+            .unwrap_or(fallback_dir)
+            .to_path_buf();
+        let _ = tokio::fs::create_dir_all(&base_dir).await;
+
+        let dht_file = self.data_dir.as_ref().map(|d| d.join("bt-dht.json"));
+        let opts = build_session_options_with_dht_path(bt, proxy_url, dht_file);
+
+        let session = Session::new_with_opts(fallback_dir.to_path_buf(), opts)
+            .await
+            .map_err(|e| SiphonError::Network(format!("BitTorrent 会话初始化失败: {e}")))?;
+
+        *guard = Some(WarmSession {
+            fingerprint: fp,
+            session: Arc::clone(&session),
+        });
+        Ok((session, false))
     }
 }
 
@@ -103,24 +221,45 @@ pub async fn sync_trackers_from_urls(
 
 /// Build `librqbit::SessionOptions` directly from Siphon's `BtConfig` + optional proxy URL.
 pub fn build_session_options(bt: &BtConfig, proxy_url: Option<&str>) -> SessionOptions {
+    build_session_options_with_dht_path(bt, proxy_url, None)
+}
+
+pub fn build_session_options_with_dht_path(
+    bt: &BtConfig,
+    proxy_url: Option<&str>,
+    dht_config_path: Option<PathBuf>,
+) -> SessionOptions {
     let dht = if bt.enable_dht {
+        let persistence = dht_config_path.map(|path| DhtPersistenceConfig {
+            dump_interval: Some(Duration::from_secs(30)),
+            config_filename: Some(path),
+        });
         Some(DhtSessionConfig {
-            persistence: None,
-            ..Default::default()
+            bootstrap_addrs: Some(vec![
+                "router.bittorrent.com:6881".to_string(),
+                "router.utorrent.com:6881".to_string(),
+                "dht.transmissionbt.com:6881".to_string(),
+                "dht.aelitis.com:6881".to_string(),
+                "dht.libtorrent.org:25401".to_string(),
+            ]),
+            port: if bt.listen_port > 0 {
+                Some(bt.listen_port)
+            } else {
+                None
+            },
+            persistence,
         })
     } else {
         None
     };
 
-    let listen = if bt.listen_port > 0 || bt.enable_upnp {
-        Some(ListenerOptions {
-            listen_addr: (Ipv4Addr::UNSPECIFIED, bt.listen_port).into(),
-            enable_upnp_port_forwarding: bt.enable_upnp,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
+    let listen = Some(ListenerOptions {
+        mode: ListenerMode::TcpAndUtp,
+        listen_addr: (Ipv4Addr::UNSPECIFIED, bt.listen_port).into(),
+        enable_upnp_port_forwarding: bt.enable_upnp,
+        ipv4_only: true,
+        ..Default::default()
+    });
 
     let socks_proxy = proxy_url
         .map(str::trim)
@@ -131,7 +270,8 @@ pub fn build_session_options(bt: &BtConfig, proxy_url: Option<&str>) -> SessionO
         enable_tcp: true,
         proxy_url: socks_proxy,
         peer_opts: Some(PeerConnectionOptions {
-            connect_timeout: Some(Duration::from_secs(bt.peer_connect_timeout_secs.clamp(3, 60))),
+            connect_timeout: Some(Duration::from_secs(bt.peer_connect_timeout_secs.clamp(2, 60))),
+            read_write_timeout: Some(Duration::from_secs(12)),
             ..Default::default()
         }),
     });
@@ -155,13 +295,21 @@ pub fn build_session_options(bt: &BtConfig, proxy_url: Option<&str>) -> SessionO
         connect,
         trackers,
         peer_limit: Some(bt.max_peers_per_torrent.clamp(10, 500)),
+        ipv4_only: true,
         client_name_and_version: Some(format!("Siphon/{}", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     }
 }
 
-/// Build `librqbit::AddTorrentOptions` with custom/synced trackers injected when enabled.
+/// Build `librqbit::AddTorrentOptions` with per-task output folder and custom/synced trackers injected.
 pub fn build_add_torrent_options(bt: &BtConfig) -> AddTorrentOptions {
+    build_add_torrent_options_for_dir(bt, None)
+}
+
+pub fn build_add_torrent_options_for_dir(
+    bt: &BtConfig,
+    output_dir: Option<&Path>,
+) -> AddTorrentOptions {
     let trackers = if bt.auto_append_trackers && !bt.disable_trackers {
         let list = bt.effective_trackers();
         if list.is_empty() { None } else { Some(list) }
@@ -171,8 +319,10 @@ pub fn build_add_torrent_options(bt: &BtConfig) -> AddTorrentOptions {
 
     AddTorrentOptions {
         overwrite: true,
+        output_folder: output_dir.map(|p| p.to_string_lossy().to_string()),
         disable_trackers: bt.disable_trackers,
         peer_limit: Some(bt.max_peers_per_torrent.clamp(10, 500)),
+        force_tracker_interval: Some(Duration::from_secs(60)),
         trackers,
         ..Default::default()
     }
@@ -309,27 +459,28 @@ impl ProtocolHandler for BitTorrentEngine {
     }
 
     async fn download(&self, ctx: DownloadContext) -> Result<DownloadOutcome> {
+        let t0 = Instant::now();
         let output_dir = ctx.task.save_dir.clone();
         tokio::fs::create_dir_all(&output_dir).await?;
 
-        let opts = build_session_options(&ctx.bt_config, ctx.proxy_url.as_deref());
-        let tracker_count = opts.trackers.len();
+        let (session, reused) = self
+            .get_or_create_session(&ctx.bt_config, &output_dir, ctx.proxy_url.as_deref())
+            .await?;
+
+        let add_opts = build_add_torrent_options_for_dir(&ctx.bt_config, Some(&output_dir));
+        let tracker_count = add_opts.trackers.as_ref().map(|v| v.len()).unwrap_or(0);
         push_log(
             &ctx,
             "info",
             format!(
-                "初始化 BitTorrent 会话（DHT={}, LSD={}, UPnP={}, 注入自定义 Tracker={} 个）-> {}",
+                "BitTorrent 会话{}（{} ms，TCP+uTP，DHT={}，注入 Tracker={} 条）-> {}",
+                if reused { "热复用" } else { "已初始化" },
+                t0.elapsed().as_millis(),
                 ctx.bt_config.enable_dht,
-                ctx.bt_config.enable_lsd,
-                ctx.bt_config.enable_upnp,
                 tracker_count,
                 output_dir.display()
             ),
         );
-
-        let session = Session::new_with_opts(output_dir.clone(), opts)
-            .await
-            .map_err(|e| SiphonError::Network(format!("BitTorrent 会话初始化失败: {e}")))?;
 
         let raw_url = ctx.task.original_url.trim().to_string();
         let add_req = if let Some(local_path) = local_torrent_path_from_url(&raw_url) {
@@ -344,11 +495,8 @@ impl ProtocolHandler for BitTorrentEngine {
             AddTorrent::from_url(&raw_url)
         };
 
-        let add_opts = build_add_torrent_options(&ctx.bt_config);
-
         let response = tokio::select! {
             _ = ctx.cancel.cancelled() => {
-                session.stop().await;
                 return Err(SiphonError::Cancelled);
             }
             res = session.add_torrent(add_req, Some(add_opts)) => {
@@ -356,23 +504,30 @@ impl ProtocolHandler for BitTorrentEngine {
             }
         };
 
-        let handle = match response {
-            AddTorrentResponse::Added(_, h) | AddTorrentResponse::AlreadyManaged(_, h) => h,
+        let (torrent_id, handle) = match response {
+            AddTorrentResponse::Added(id, h) | AddTorrentResponse::AlreadyManaged(id, h) => {
+                (id, h)
+            }
             AddTorrentResponse::ListOnly(_) => {
-                session.stop().await;
                 return Err(SiphonError::Network("种子仅处于列表模式".into()));
             }
         };
 
-        push_log(&ctx, "info", "已加入 BitTorrent Swarm，正在获取元数据与连接节点...");
+        push_log(
+            &ctx,
+            "info",
+            format!(
+                "已加入 BitTorrent Swarm（耗时 {} ms），正在并发探测元数据与 Peer...",
+                t0.elapsed().as_millis()
+            ),
+        );
 
         let mut metadata_emitted = false;
-        let mut last_peers: u32 = 0;
+        let mut last_peer_summary = (0u32, 0u32);
 
         loop {
             if ctx.cancel.is_cancelled() {
-                let _ = session.pause(&handle).await;
-                session.stop().await;
+                let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
                 return Err(SiphonError::Cancelled);
             }
 
@@ -401,29 +556,36 @@ impl ProtocolHandler for BitTorrentEngine {
                     &ctx,
                     "info",
                     format!(
-                        "元数据就绪: {} ({} bytes)",
-                        resolved_name, stats.total_bytes
+                        "元数据就绪: {} ({} bytes，总初始化 {:.1}s)",
+                        resolved_name,
+                        stats.total_bytes,
+                        t0.elapsed().as_secs_f32()
                     ),
                 );
             }
 
-            let (speed_bps, eta_secs, live_peers) = if let Some(live) = stats.live.as_ref() {
-                let bps = (live.download_speed.mbps * 1024.0 * 1024.0).max(0.0) as u64;
-                let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
-                let eta = if bps > 0 && stats.total_bytes > 0 {
-                    Some(remaining / bps)
+            let (speed_bps, eta_secs, live_peers, seen_peers) =
+                if let Some(live) = stats.live.as_ref() {
+                    let bps = (live.download_speed.mbps * 1024.0 * 1024.0).max(0.0) as u64;
+                    let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
+                    let eta = if bps > 0 && stats.total_bytes > 0 {
+                        Some(remaining / bps)
+                    } else {
+                        None
+                    };
+                    let ps = &live.snapshot.peer_stats;
+                    (bps, eta, ps.live, ps.seen)
                 } else {
-                    None
+                    (0, None, 0, 0)
                 };
-                let peers = live.snapshot.peer_stats.live;
-                (bps, eta, peers)
-            } else {
-                (0, None, 0)
-            };
 
-            if live_peers != last_peers && live_peers > 0 {
-                last_peers = live_peers;
-                push_log(&ctx, "info", format!("当前活跃 Peer 节点: {live_peers}"));
+            if (live_peers, seen_peers) != last_peer_summary && (live_peers > 0 || seen_peers > 0) {
+                last_peer_summary = (live_peers, seen_peers);
+                push_log(
+                    &ctx,
+                    "info",
+                    format!("Peer 状态：活跃连接 {live_peers} · 已发现 {seen_peers}"),
+                );
             }
 
             let segments = build_bt_segments(
@@ -446,14 +608,14 @@ impl ProtocolHandler for BitTorrentEngine {
             });
 
             if let Some(err) = stats.error {
-                session.stop().await;
+                let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
                 return Err(SiphonError::Network(format!("BitTorrent 传输错误: {err}")));
             }
 
             if stats.finished {
                 let total_bytes = stats.total_bytes.max(stats.progress_bytes);
                 push_log(&ctx, "info", "BitTorrent 全部数据校验并下载完成");
-                session.stop().await;
+                let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
                 return Ok(DownloadOutcome {
                     total_bytes,
                     verified_hash: None,
@@ -462,8 +624,7 @@ impl ProtocolHandler for BitTorrentEngine {
 
             tokio::select! {
                 _ = ctx.cancel.cancelled() => {
-                    let _ = session.pause(&handle).await;
-                    session.stop().await;
+                    let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
                     return Err(SiphonError::Cancelled);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {}
@@ -539,7 +700,9 @@ mod tests {
         assert!(engine.supports_url("file:///C:/Users/Test/Downloads/sample.torrent"));
         assert!(!engine.supports_url("https://example.com/file.zip"));
         assert!(!engine.supports_url("https://example.com/playlist.m3u8"));
-        assert!(!engine.supports_url("ed2k://|file|test.iso|1024|31D6CFE0D16AE931B73C59D7E0C089C0|/"));
+        assert!(!engine.supports_url(
+            "ed2k://|file|test.iso|1024|31D6CFE0D16AE931B73C59D7E0C089C0|/"
+        ));
     }
 
     #[tokio::test]
@@ -567,7 +730,7 @@ mod tests {
             enable_upnp: true,
             disable_trackers: false,
             listen_port: 6889,
-            peer_connect_timeout_secs: 15,
+            peer_connect_timeout_secs: 5,
             max_peers_per_torrent: 200,
             auto_append_trackers: true,
             custom_trackers: vec![
@@ -575,7 +738,7 @@ mod tests {
                 "https://tracker.example.net/announce".into(),
             ],
             synced_trackers: vec![
-                "udp://tracker.example.org:1337/announce".into(), // duplicate
+                "udp://tracker.example.org:1337/announce".into(),
                 "udp://synced.example.com:80/announce".into(),
             ],
             ..Default::default()
@@ -584,6 +747,7 @@ mod tests {
         let sess = build_session_options(&bt, Some("socks5://127.0.0.1:1080"));
         assert!(sess.dht.is_none());
         assert!(sess.disable_local_service_discovery);
+        assert!(sess.ipv4_only);
         assert_eq!(sess.peer_limit, Some(200));
         assert_eq!(sess.trackers.len(), 3);
         let listen = sess.listen.expect("listen options present");
@@ -594,7 +758,8 @@ mod tests {
             Some("socks5://127.0.0.1:1080")
         );
 
-        let add = build_add_torrent_options(&bt);
+        let add = build_add_torrent_options_for_dir(&bt, Some(Path::new(r"D:\Downloads")));
+        assert_eq!(add.output_folder.as_deref(), Some(r"D:\Downloads"));
         let list = add.trackers.expect("trackers injected");
         assert_eq!(list.len(), 3);
         assert_eq!(list[0], "udp://tracker.example.org:1337/announce");
@@ -636,5 +801,46 @@ mod tests {
                 "udp://t3.example:6969/announce",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn warm_session_is_reused_across_calls_and_rebuilt_on_config_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = BitTorrentEngine::with_data_dir(dir.path().to_path_buf());
+        let mut bt = BtConfig {
+            enable_dht: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            disable_trackers: true,
+            listen_port: 0,
+            peer_connect_timeout_secs: 3,
+            max_peers_per_torrent: 40,
+            auto_append_trackers: false,
+            ..Default::default()
+        };
+
+        let (s1, reused1) = engine
+            .get_or_create_session(&bt, dir.path(), None)
+            .await
+            .unwrap();
+        assert!(!reused1);
+
+        let (s2, reused2) = engine
+            .get_or_create_session(&bt, dir.path(), None)
+            .await
+            .unwrap();
+        assert!(reused2);
+        assert!(Arc::ptr_eq(&s1, &s2));
+
+        // Changing peer limit invalidates fingerprint and replaces the warm session cleanly
+        bt.max_peers_per_torrent = 80;
+        let (s3, reused3) = engine
+            .get_or_create_session(&bt, dir.path(), None)
+            .await
+            .unwrap();
+        assert!(!reused3);
+        assert!(!Arc::ptr_eq(&s1, &s3));
+
+        s3.stop().await;
     }
 }

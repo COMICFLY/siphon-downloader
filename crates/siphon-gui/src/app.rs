@@ -30,7 +30,7 @@ use siphon_engine_ed2k::{
     Ed2kEngine, parse_ed2k_server_link, sync_servers_from_met, test_ed2k_server,
 };
 use siphon_engine_hls::HlsEngine;
-use siphon_engine_http::{HttpEngine, check_for_updates};
+use siphon_engine_http::{HttpEngine, check_for_updates, probe_urls_sizes, sniff_webpage_url};
 use siphon_platform_win::{
     BrowserCapturePayload, BrowserSniffPayload, DropEvent, FileIconKey, IpcCommand, TrayAction,
     TrayController, WinHookEvent, apply_win11_backdrop, deploy_browser_extension,
@@ -51,6 +51,7 @@ use uuid::Uuid;
 
 struct SharedRuntime {
     manager: Arc<DownloadManager>,
+    bt_engine: Arc<BitTorrentEngine>,
     clipboard_enabled: Arc<AtomicBool>,
     browser_enabled: Arc<AtomicBool>,
     start_minimized: AtomicBool,
@@ -84,11 +85,13 @@ pub fn init_shared_runtime() -> Arc<DownloadManager> {
             }
         }
 
+        let bt_engine = Arc::new(BitTorrentEngine::with_data_dir(data_dir.clone()));
+
         let manager = DownloadManager::new(
             data_dir,
             vec![
                 Arc::new(HlsEngine::new()),
-                Arc::new(BitTorrentEngine::new()),
+                Arc::clone(&bt_engine) as Arc<dyn siphon_core::ProtocolHandler>,
                 Arc::new(Ed2kEngine::new()),
                 Arc::new(HttpEngine::new()),
             ],
@@ -110,6 +113,7 @@ pub fn init_shared_runtime() -> Arc<DownloadManager> {
 
         Arc::new(SharedRuntime {
             manager,
+            bt_engine,
             clipboard_enabled,
             browser_enabled,
             start_minimized: AtomicBool::new(false),
@@ -409,7 +413,7 @@ impl SiphonApp {
         if let Some(sniff) = &self.sniff_popup
             && sniff.window_id == Some(window_id)
         {
-            return format!("Siphon 资源嗅探 ({} 项)", sniff.items.len());
+            return format!("Siphon 嗅探资源选择性下载 ({} 项)", sniff.items.len());
         }
         if let Some(dp) = self.download_popups.get(&window_id) {
             if let Some(task) = self.tasks.iter().find(|t| t.id == dp.task_id) {
@@ -776,7 +780,11 @@ impl SiphonApp {
                     }
                 }
             } else {
-                existing.page_url = incoming_page_url;
+                existing.page_url = incoming_page_url.clone();
+                if !incoming_page_url.is_empty() {
+                    existing.page_url_input = incoming_page_url;
+                }
+                existing.sniff_error = None;
                 existing.filter = SniffFilterKind::All;
                 existing.search.clear();
                 existing.items.clear();
@@ -814,8 +822,8 @@ impl SiphonApp {
         let (rgba, w, h) = siphon_platform_win::generate_siphon_icon_rgba();
         let app_icon = window::icon::from_rgba(rgba, w, h).ok();
         let settings = window::Settings {
-            size: iced::Size::new(740.0, 540.0),
-            min_size: Some(iced::Size::new(640.0, 440.0)),
+            size: iced::Size::new(780.0, 580.0),
+            min_size: Some(iced::Size::new(680.0, 480.0)),
             position: window::Position::Centered,
             decorations: false,
             transparent: true,
@@ -831,13 +839,18 @@ impl SiphonApp {
             window_id: Some(wid),
             window_hwnd: None,
             page_title: incoming_page_title,
+            page_url_input: incoming_page_url.clone(),
             page_url: incoming_page_url,
+            sniffing_page: false,
+            probing_sizes: false,
+            sniff_error: None,
             headers,
             items: entries,
             next_entry_id: next_id,
             filter: SniffFilterKind::All,
             search: String::new(),
             save_dir: self.config.default_save_dir.to_string_lossy().to_string(),
+            connections: self.config.default_connections.clamp(1, 32),
         });
         self.context_menu = None;
 
@@ -1136,7 +1149,10 @@ impl SiphonApp {
                     InputTarget::CaptureFilename | InputTarget::CaptureSaveDir
                 ) {
                     self.capture_cursor_pos
-                } else if matches!(target, InputTarget::SniffSearch | InputTarget::SniffSaveDir) {
+                } else if matches!(
+                    target,
+                    InputTarget::SniffPageUrl | InputTarget::SniffSearch | InputTarget::SniffSaveDir
+                ) {
                     self.sniff_cursor_pos
                 } else {
                     self.cursor_pos
@@ -1155,7 +1171,9 @@ impl SiphonApp {
                     || (self.sniff_popup.is_some()
                         && matches!(
                             self.active_input,
-                            InputTarget::SniffSearch | InputTarget::SniffSaveDir
+                            InputTarget::SniffPageUrl
+                                | InputTarget::SniffSearch
+                                | InputTarget::SniffSaveDir
                         ))
                 {
                     self.active_input
@@ -1765,7 +1783,35 @@ impl SiphonApp {
                 }
             },
 
-            // Standalone Browser Resource Sniff Manager Window
+            // Standalone Browser Resource Sniff & Selective Download Window
+            Message::OpenEmptySniffPopup => {
+                if let Some(existing) = &self.sniff_popup {
+                    if let Some(hwnd) = existing.window_hwnd {
+                        show_window_native(hwnd);
+                    }
+                    if let Some(wid) = existing.window_id {
+                        self.active_input = InputTarget::SniffPageUrl;
+                        return Task::batch([
+                            window::gain_focus(wid),
+                            operation::focus(views::sniff_popup::sniff_page_url_id()),
+                        ]);
+                    }
+                }
+                let task = self.open_or_update_sniff_popup(BrowserSniffPayload {
+                    page_url: None,
+                    page_title: None,
+                    referrer: None,
+                    cookie: None,
+                    user_agent: None,
+                    bring_to_front: true,
+                    items: Vec::new(),
+                });
+                self.active_input = InputTarget::SniffPageUrl;
+                return Task::batch([
+                    task,
+                    operation::focus(views::sniff_popup::sniff_page_url_id()),
+                ]);
+            }
             Message::SniffWindowOpened(id) => {
                 if let Some(s) = &mut self.sniff_popup {
                     s.window_id = Some(id);
@@ -1793,6 +1839,94 @@ impl SiphonApp {
                     && let Some(wid) = s.window_id
                 {
                     return window::close(wid);
+                }
+            }
+            Message::SniffPageUrlChanged(v) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.page_url_input = v;
+                    s.sniff_error = None;
+                }
+            }
+            Message::SniffFetchPageUrl => {
+                let Some(s) = &mut self.sniff_popup else {
+                    return Task::none();
+                };
+                let url = s.page_url_input.trim().to_string();
+                if url.is_empty() || s.sniffing_page {
+                    return Task::none();
+                }
+                s.sniffing_page = true;
+                s.sniff_error = None;
+                let proxy = self.config.proxy_url.clone();
+                let ua = self.config.user_agent.clone();
+                return Task::perform(
+                    async move {
+                        sniff_webpage_url(&url, proxy.as_deref(), &ua)
+                            .await
+                            .map(|(title, items)| (url, title, items))
+                    },
+                    Message::SniffFetchPageFinished,
+                );
+            }
+            Message::SniffFetchPageFinished(res) => {
+                let mut should_auto_probe = false;
+                if let Some(s) = &mut self.sniff_popup {
+                    s.sniffing_page = false;
+                    match res {
+                        Ok((url, title, items)) => {
+                            s.page_url = url.clone();
+                            s.page_title = title;
+                            s.sniff_error = None;
+                            s.headers.insert("Referer".to_string(), url);
+                            s.headers
+                                .entry("User-Agent".to_string())
+                                .or_insert_with(|| self.config.user_agent.clone());
+                            s.filter = SniffFilterKind::All;
+                            s.search.clear();
+                            s.items.clear();
+
+                            let has_non_image = items.iter().any(|i| i.kind != "image");
+                            let mut unknown_http = 0usize;
+                            for it in items {
+                                let id = s.next_entry_id;
+                                s.next_entry_id += 1;
+                                let selected = if has_non_image {
+                                    it.kind != "image"
+                                } else {
+                                    true
+                                };
+                                if it.file_size.is_none()
+                                    && (it.url.starts_with("http://")
+                                        || it.url.starts_with("https://"))
+                                {
+                                    unknown_http += 1;
+                                }
+                                s.items.push(SniffEntry {
+                                    id,
+                                    url: it.url,
+                                    filename: it.filename,
+                                    kind: it.kind,
+                                    label: it.label,
+                                    mime: it.mime,
+                                    file_size: it.file_size,
+                                    selected,
+                                });
+                            }
+                            if s.items.is_empty() {
+                                s.sniff_error = Some(
+                                    "该页面未发现静态直链资源（如为动态 JS 播放页，请打开浏览器扩展开启嗅探或点击「扫描当前页」）".to_string(),
+                                );
+                            } else if unknown_http > 0 && unknown_http <= 20 {
+                                should_auto_probe = true;
+                            }
+                        }
+                        Err(e) => {
+                            s.sniff_error = Some(e);
+                        }
+                    }
+                }
+                if should_auto_probe {
+                    return self.update(Message::SniffProbeSizes);
                 }
             }
             Message::SniffSetFilter(f) => {
@@ -1825,6 +1959,59 @@ impl SiphonApp {
                     }
                 }
             }
+            Message::SniffInvertSelection => {
+                if let Some(s) = &mut self.sniff_popup {
+                    let visible_ids: HashSet<usize> = views::sniff_popup::visible_entries(s)
+                        .into_iter()
+                        .map(|e| e.id)
+                        .collect();
+                    for item in &mut s.items {
+                        if visible_ids.contains(&item.id) {
+                            item.selected = !item.selected;
+                        }
+                    }
+                }
+            }
+            Message::SniffProbeSizes => {
+                let Some(s) = &mut self.sniff_popup else {
+                    return Task::none();
+                };
+                if s.probing_sizes {
+                    return Task::none();
+                }
+                let urls: Vec<String> = views::sniff_popup::visible_entries(s)
+                    .into_iter()
+                    .filter(|e| {
+                        e.file_size.is_none()
+                            && (e.url.starts_with("http://") || e.url.starts_with("https://"))
+                    })
+                    .take(24)
+                    .map(|e| e.url.clone())
+                    .collect();
+                if urls.is_empty() {
+                    return Task::none();
+                }
+                s.probing_sizes = true;
+                let headers = s.headers.clone();
+                let proxy = self.config.proxy_url.clone();
+                let ua = self.config.user_agent.clone();
+                return Task::perform(
+                    async move { probe_urls_sizes(urls, headers, proxy, ua).await },
+                    Message::SniffProbeSizesFinished,
+                );
+            }
+            Message::SniffProbeSizesFinished(results) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.probing_sizes = false;
+                    for (url, size) in results {
+                        if let Some(sz) = size
+                            && let Some(item) = s.items.iter_mut().find(|e| e.url == url)
+                        {
+                            item.file_size = Some(sz);
+                        }
+                    }
+                }
+            }
             Message::SniffRemoveItem(entry_id) => {
                 if let Some(s) = &mut self.sniff_popup {
                     s.items.retain(|e| e.id != entry_id);
@@ -1833,11 +2020,17 @@ impl SiphonApp {
             Message::SniffClearAll => {
                 if let Some(s) = &mut self.sniff_popup {
                     s.items.clear();
+                    s.sniff_error = None;
                 }
             }
             Message::SniffSaveDirChanged(v) => {
                 if let Some(s) = &mut self.sniff_popup {
                     s.save_dir = v;
+                }
+            }
+            Message::SniffConnectionsChanged(v) => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.connections = (v.round() as u32).clamp(1, 32);
                 }
             }
             Message::SniffBrowseDir => {
@@ -1869,6 +2062,7 @@ impl SiphonApp {
                 {
                     let entry = s.items.remove(idx);
                     let headers = s.headers.clone();
+                    let connections = s.connections.clamp(1, 32);
                     let save_dir = {
                         let d = s.save_dir.trim();
                         if d.is_empty() {
@@ -1881,14 +2075,14 @@ impl SiphonApp {
                         url: entry.url,
                         filename: Some(entry.filename.clone()),
                         save_dir,
-                        max_connections: None,
+                        max_connections: Some(connections),
                         speed_limit_bps: None,
                         headers,
                         checksum: None,
                         source: TaskSource::Browser,
                         auto_start: true,
                     };
-                    self.toast = Some(format!("已从嗅探窗开始下载: {}", entry.filename));
+                    self.toast = Some(format!("已从嗅探选择窗开始下载: {}", entry.filename));
                     let mgr = Arc::clone(&self.manager);
                     return Task::perform(
                         async move { mgr.add_task(req).await.map_err(|e| e.to_string()) },
@@ -1905,6 +2099,7 @@ impl SiphonApp {
                     }
                     let count = chosen.len();
                     let headers = s.headers.clone();
+                    let connections = s.connections.clamp(1, 32);
                     let save_dir = {
                         let d = s.save_dir.trim();
                         if d.is_empty() {
@@ -1920,7 +2115,7 @@ impl SiphonApp {
                         None
                     };
                     self.toast = Some(format!(
-                        "已从资源嗅探窗提交 {count} 个任务（{}）",
+                        "已从嗅探选择窗提交 {count} 个任务（{}）",
                         if auto_start { "开始下载" } else { "加入暂停队列" }
                     ));
                     let mgr = Arc::clone(&self.manager);
@@ -1932,7 +2127,7 @@ impl SiphonApp {
                                     url: entry.url,
                                     filename: Some(entry.filename),
                                     save_dir: save_dir.clone(),
-                                    max_connections: None,
+                                    max_connections: Some(connections),
                                     speed_limit_bps: None,
                                     headers: headers.clone(),
                                     checksum: None,
@@ -2818,6 +3013,20 @@ impl SiphonApp {
                 self.bt_max_peers_input = self.config.bt.max_peers_per_torrent.to_string();
                 self.bt_timeout_input = self.config.bt.peer_connect_timeout_secs.to_string();
                 self.toast = Some("BitTorrent 与自定义 Tracker 设置已保存".to_string());
+                if let Some(shared) = SHARED.get() {
+                    let bt_engine = Arc::clone(&shared.bt_engine);
+                    let bt_cfg = self.config.bt.clone();
+                    let out_dir = self.config.default_save_dir.clone();
+                    let proxy = self.config.proxy_url.clone();
+                    let save_task = self.save_config_async();
+                    let warm_task = Task::perform(
+                        async move {
+                            bt_engine.warmup(&bt_cfg, &out_dir, proxy.as_deref()).await;
+                        },
+                        |_| Message::ClearToast,
+                    );
+                    return Task::batch([save_task, warm_task]);
+                }
                 return self.save_config_async();
             }
 
@@ -3801,6 +4010,11 @@ impl SiphonApp {
                 .as_ref()
                 .map(|p| p.save_dir.as_str())
                 .unwrap_or(""),
+            InputTarget::SniffPageUrl => self
+                .sniff_popup
+                .as_ref()
+                .map(|s| s.page_url_input.as_str())
+                .unwrap_or(""),
             InputTarget::SniffSearch => self
                 .sniff_popup
                 .as_ref()
@@ -3877,6 +4091,12 @@ impl SiphonApp {
                     popup.save_dir_edited_by_user = true;
                 }
             }
+            InputTarget::SniffPageUrl => {
+                if let Some(s) = &mut self.sniff_popup {
+                    s.page_url_input = val;
+                    s.sniff_error = None;
+                }
+            }
             InputTarget::SniffSearch => {
                 if let Some(s) = &mut self.sniff_popup {
                     s.search = val;
@@ -3909,7 +4129,10 @@ impl SiphonApp {
 
         let is_url_box = matches!(
             target,
-            InputTarget::QuickBar | InputTarget::ModalUrl | InputTarget::ReplaceUrl
+            InputTarget::QuickBar
+                | InputTarget::ModalUrl
+                | InputTarget::ReplaceUrl
+                | InputTarget::SniffPageUrl
         );
         let low = cleaned.to_ascii_lowercase();
         let pasted_is_url = low.starts_with("http://")
@@ -3930,6 +4153,7 @@ impl SiphonApp {
             match target {
                 InputTarget::QuickBar => return self.update(Message::QuickBarSubmit),
                 InputTarget::ModalUrl => return self.update(Message::ModalProbeUrl),
+                InputTarget::SniffPageUrl => return self.update(Message::SniffFetchPageUrl),
                 _ => {}
             }
         }
@@ -3938,6 +4162,7 @@ impl SiphonApp {
             InputTarget::QuickBar => operation::focus(views::titlebar::quick_bar_id()),
             InputTarget::ModalUrl => operation::focus(views::new_task::modal_url_id()),
             InputTarget::ReplaceUrl => operation::focus(views::inspector::replace_url_id()),
+            InputTarget::SniffPageUrl => operation::focus(views::sniff_popup::sniff_page_url_id()),
             _ => Task::none(),
         }
     }
@@ -3985,6 +4210,12 @@ impl SiphonApp {
                 "",
                 Some(Message::ContextPasteAndGo(target)),
             ));
+        } else if target == InputTarget::SniffPageUrl {
+            items = items.push(item(
+                "粘贴并嗅探网页",
+                "",
+                Some(Message::ContextPasteAndGo(target)),
+            ));
         }
 
         items = items
@@ -4007,8 +4238,11 @@ impl SiphonApp {
             InputTarget::CaptureFilename | InputTarget::CaptureSaveDir
         ) {
             (620.0f32, 404.0f32)
-        } else if matches!(target, InputTarget::SniffSearch | InputTarget::SniffSaveDir) {
-            (740.0f32, 540.0f32)
+        } else if matches!(
+            target,
+            InputTarget::SniffPageUrl | InputTarget::SniffSearch | InputTarget::SniffSaveDir
+        ) {
+            (780.0f32, 580.0f32)
         } else {
             (self.window_size.width, self.window_size.height)
         };
@@ -4187,7 +4421,7 @@ impl SiphonApp {
             return popup_base;
         }
 
-        // Render standalone Browser Resource Sniff Manager window when `window_id` belongs to `sniff_popup`
+        // Render standalone Browser Resource Sniff & Selective Download window when `window_id` belongs to `sniff_popup`
         if let Some(sniff) = &self.sniff_popup
             && sniff.window_id == Some(window_id)
         {
@@ -4195,7 +4429,9 @@ impl SiphonApp {
             if let Some(menu) = self.context_menu
                 && matches!(
                     menu.target,
-                    InputTarget::SniffSearch | InputTarget::SniffSaveDir
+                    InputTarget::SniffPageUrl
+                        | InputTarget::SniffSearch
+                        | InputTarget::SniffSaveDir
                 )
             {
                 let menu_layer = self.view_context_menu(menu, palette);
@@ -4456,6 +4692,7 @@ impl SiphonApp {
                 menu.target,
                 InputTarget::CaptureFilename
                     | InputTarget::CaptureSaveDir
+                    | InputTarget::SniffPageUrl
                     | InputTarget::SniffSearch
                     | InputTarget::SniffSaveDir
             )
@@ -4485,8 +4722,25 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
         // Start Named Pipe IPC server & local HTTP browser capture bridge inside Iced's Tokio runtime
         let (ipc_tx, mut ipc_rx) = mpsc::unbounded_channel();
         spawn_ipc_server(ipc_tx.clone());
-        let port = mgr.config().await.browser_bridge_port;
-        spawn_browser_http_bridge(port, Arc::clone(&shared.browser_enabled), ipc_tx);
+        let init_cfg = mgr.config().await;
+        spawn_browser_http_bridge(
+            init_cfg.browser_bridge_port,
+            Arc::clone(&shared.browser_enabled),
+            ipc_tx,
+        );
+
+        // Pre-warm shared BitTorrent session + persisted DHT routing table in the background so
+        // subsequent Magnet / .torrent tasks join swarms in milliseconds instead of cold-booting.
+        let bt_warm = Arc::clone(&shared.bt_engine);
+        tokio::spawn(async move {
+            bt_warm
+                .warmup(
+                    &init_cfg.bt,
+                    &init_cfg.default_save_dir,
+                    init_cfg.proxy_url.as_deref(),
+                )
+                .await;
+        });
 
         // Start 500ms global speed ticker and 10s scheduler ticker inside Iced's Tokio runtime
         let mut speed_ticker = tokio::time::interval(std::time::Duration::from_millis(500));

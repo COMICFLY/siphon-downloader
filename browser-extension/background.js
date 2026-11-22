@@ -1,53 +1,103 @@
 const SIPHON_ENDPOINT = "http://127.0.0.1:16800";
 const NATIVE_HOST_NAME = "com.siphon.downloader";
-const CLIENT_VERSION = "chrome-extension/0.5.1";
+const CLIENT_VERSION = "chrome-extension/0.6.0";
 
-const CAPTURE_EXT_RE = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|ts|m4v|m3u8|mp3|flac|wav|aac|ogg|m4a|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
-const M3U8_URL_RE = /\.m3u8(\?|$)/i;
-const VIDEO_URL_RE = /\.(mp4|mkv|webm|mov|avi|flv|m4v)(\?|$)/i;
-const AUDIO_URL_RE = /\.(mp3|flac|wav|aac|ogg|m4a)(\?|$)/i;
+const CAPTURE_EXT_RE = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|f4v|ts|m4s|m4v|m3u8|mpd|mp3|flac|wav|aac|ogg|m4a|opus|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
+const M3U8_URL_RE = /\.(m3u8|m3u)(\?|$|&)/i;
+const MPD_URL_RE = /\.mpd(\?|$|&)/i;
+const VIDEO_URL_RE = /\.(mp4|mkv|webm|mov|avi|flv|f4v|m4v|m4s)(\?|$|&)/i;
+const AUDIO_URL_RE = /\.(mp3|flac|wav|aac|ogg|m4a|opus)(\?|$|&)/i;
+const QUERY_VIDEO_HINT_RE = /(?:mime_type|mime|format|media_type|type)=(?:video|mp4|flv|webm|m3u8|hls|mpegurl)/i;
+const QUERY_AUDIO_HINT_RE = /(?:mime_type|mime|format|media_type|type)=(?:audio|mp3|m4a|aac|flac|ogg)/i;
 const DOWNLOADABLE_URL_RE = /(?:https?:\/\/[^\s"'<>()\[\]{}]+|magnet:\?[^\s"'<>()\[\]{}]+|ed2k:\/\/\|file\|[^\s"'<>()\[\]{}]+)/gi;
 
-// Keep track of download IDs already handled to avoid duplicate capture
 const handledIds = new Set();
 
-// Sniffing is DISABLED by default; user must opt-in manually.
-// When disabled, Siphon is ONLY auto-launched on actual download actions.
+// Hydrate sniffEnabled reliably even right after MV3 service worker wake-up
 let sniffEnabled = false;
+let sniffFlagPromise = null;
 
-// Live-sniffed network streams per browser tab (only populated when sniffEnabled === true)
-const tabSniffedStreams = new Map();
+function ensureSniffFlagLoaded() {
+  if (!sniffFlagPromise) {
+    sniffFlagPromise = new Promise((resolve) => {
+      chrome.storage.local.get({ sniffEnabled: false }, (res) => {
+        sniffEnabled = Boolean(res.sniffEnabled);
+        resolve(sniffEnabled);
+      });
+    });
+  }
+  return sniffFlagPromise;
+}
+
+ensureSniffFlagLoaded();
+
+// Write-through per-tab sniff cache backed by chrome.storage.session so MV3 SW sleep NEVER wipes sniffed streams!
+const tabStreamsMem = new Map();
 const tabAutoPoppedUrl = new Map();
 const tabAutoTimers = new Map();
 
-function syncSniffFlagFromStorage() {
-  chrome.storage.local.get({ sniffEnabled: false }, (res) => {
-    sniffEnabled = Boolean(res.sniffEnabled);
-    if (!sniffEnabled) {
-      clearAllSniffCaches();
-    }
-  });
+function sessionKey(tabId) {
+  return `sniff_tab_${tabId}`;
 }
 
-function clearAllSniffCaches() {
-  tabSniffedStreams.clear();
+async function getTabStreams(tabId) {
+  if (tabStreamsMem.has(tabId)) {
+    return tabStreamsMem.get(tabId);
+  }
+  try {
+    const key = sessionKey(tabId);
+    const res = await chrome.storage.session.get(key);
+    const list = Array.isArray(res[key]) ? res[key] : [];
+    tabStreamsMem.set(tabId, list);
+    return list;
+  } catch (_) {
+    return [];
+  }
+}
+
+async function saveTabStreams(tabId, list) {
+  tabStreamsMem.set(tabId, list);
+  try {
+    await chrome.storage.session.set({ [sessionKey(tabId)]: list });
+  } catch (_) {}
+}
+
+async function clearTabStreams(tabId) {
+  tabStreamsMem.delete(tabId);
+  tabAutoPoppedUrl.delete(tabId);
+  if (tabAutoTimers.has(tabId)) {
+    clearTimeout(tabAutoTimers.get(tabId));
+    tabAutoTimers.delete(tabId);
+  }
+  try {
+    await chrome.storage.session.remove(sessionKey(tabId));
+  } catch (_) {}
+}
+
+async function clearAllSniffCaches() {
+  tabStreamsMem.clear();
   tabAutoPoppedUrl.clear();
   for (const timer of tabAutoTimers.values()) {
     clearTimeout(timer);
   }
   tabAutoTimers.clear();
+  try {
+    await chrome.storage.session.clear();
+  } catch (_) {}
+  try {
+    chrome.action.setBadgeText({ text: "" });
+  } catch (_) {}
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.sniffEnabled) {
     sniffEnabled = Boolean(changes.sniffEnabled.newValue);
+    sniffFlagPromise = Promise.resolve(sniffEnabled);
     if (!sniffEnabled) {
       clearAllSniffCaches();
     }
   }
 });
-
-syncSniffFlagFromStorage();
 
 function isHttpUrl(url) {
   return typeof url === "string" && (url.startsWith("http://") || url.startsWith("https://"));
@@ -93,20 +143,43 @@ function sendNativeToSiphon(ipcCommand) {
   });
 }
 
-function recordNetworkStream(tabId, item) {
-  if (!sniffEnabled) return false;
+function parseContentDispositionFilename(val) {
+  if (!val) return null;
+  const utf8Match = val.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].trim().replace(/^["']|["']$/g, ""));
+    } catch (_) {}
+  }
+  const plainMatch = val.match(/filename\s*=\s*"?([^";\r\n]+)"?/i);
+  if (plainMatch && plainMatch[1]) {
+    return plainMatch[1].trim();
+  }
+  return null;
+}
+
+async function recordNetworkStream(tabId, item) {
+  if (!(await ensureSniffFlagLoaded())) return false;
   if (typeof tabId !== "number" || tabId < 0 || !isHttpUrl(item.url)) return false;
   if (item.url.startsWith("http://127.0.0.1") || item.url.startsWith("http://localhost")) return false;
 
-  let list = tabSniffedStreams.get(tabId);
-  if (!list) {
-    list = [];
-    tabSniffedStreams.set(tabId, list);
-  }
+  const list = (await getTabStreams(tabId)).slice();
   const existing = list.find((x) => x.url === item.url);
   if (existing) {
-    if (!existing.file_size && item.file_size) existing.file_size = item.file_size;
-    if (!existing.mime && item.mime) existing.mime = item.mime;
+    let changed = false;
+    if (!existing.file_size && item.file_size) {
+      existing.file_size = item.file_size;
+      changed = true;
+    }
+    if (!existing.mime && item.mime) {
+      existing.mime = item.mime;
+      changed = true;
+    }
+    if (!existing.filename && item.filename) {
+      existing.filename = item.filename;
+      changed = true;
+    }
+    if (changed) await saveTabStreams(tabId, list);
     return false;
   }
 
@@ -118,21 +191,27 @@ function recordNetworkStream(tabId, item) {
     mime: item.mime || null,
     file_size: typeof item.file_size === "number" && item.file_size > 0 ? item.file_size : null
   });
-  if (list.length > 48) {
-    list.length = 48;
+  if (list.length > 80) {
+    list.length = 80;
   }
+  await saveTabStreams(tabId, list);
+
+  // Update per-tab badge immediately so user sees live sniff count like BitComet!
+  try {
+    chrome.action.setBadgeBackgroundColor({ tabId, color: "#22C55E" });
+    chrome.action.setBadgeText({ tabId, text: String(list.length) });
+  } catch (_) {}
+
   return true;
 }
 
 function scheduleAutoSniffPush(tabId) {
-  if (!sniffEnabled) return;
   if (tabAutoTimers.has(tabId)) {
     clearTimeout(tabAutoTimers.get(tabId));
   }
   const timer = setTimeout(async () => {
     tabAutoTimers.delete(tabId);
-    const st = await chrome.storage.local.get({ sniffEnabled: false });
-    if (!st.sniffEnabled) return;
+    if (!(await ensureSniffFlagLoaded())) return;
 
     let tab = null;
     try {
@@ -142,45 +221,50 @@ function scheduleAutoSniffPush(tabId) {
     }
     if (!tab || !tab.active || !tab.url || !isHttpUrl(tab.url)) return;
 
-    const streams = (tabSniffedStreams.get(tabId) || []).slice();
+    const streams = (await getTabStreams(tabId)).slice();
     if (streams.length === 0) return;
 
-    // Bring client Sniff Manager popup to front once per page URL; merge silently for extra streams
+    // Bring client selective sniff window to front once per page URL; silently merge subsequent streams
     const alreadyPopped = tabAutoPoppedUrl.get(tabId) === tab.url;
     tabAutoPoppedUrl.set(tabId, tab.url);
 
-    const ok = await sendSniffToSiphon(tab, streams, !alreadyPopped);
-    if (ok) {
-      flashBadge(String(streams.length), "#22C55E");
-    }
-  }, 550);
+    await sendSniffToSiphon(tab, streams, !alreadyPopped);
+  }, 600);
   tabAutoTimers.set(tabId, timer);
 }
 
-// Sniff .m3u8 playlist URLs ONLY when user manually enabled sniffing
+// 1. Sniff playlists & direct media URLs on request (ONLY when sniffEnabled is ON)
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (!sniffEnabled) return;
-    if (details.tabId >= 0 && M3U8_URL_RE.test(details.url)) {
-      const added = recordNetworkStream(details.tabId, {
-        url: details.url,
-        kind: "hls",
-        label: "HLS Stream (.m3u8)",
-        mime: "application/vnd.apple.mpegurl"
-      });
-      if (added) scheduleAutoSniffPush(details.tabId);
+    if (details.tabId < 0) return;
+    const url = details.url || "";
+    let item = null;
+    if (M3U8_URL_RE.test(url)) {
+      item = { url, kind: "hls", label: "HLS Stream (.m3u8)", mime: "application/vnd.apple.mpegurl" };
+    } else if (MPD_URL_RE.test(url)) {
+      item = { url, kind: "hls", label: "DASH Stream (.mpd)", mime: "application/dash+xml" };
+    } else if (QUERY_VIDEO_HINT_RE.test(url)) {
+      item = { url, kind: "video", label: "视频流媒体" };
+    } else if (QUERY_AUDIO_HINT_RE.test(url)) {
+      item = { url, kind: "audio", label: "音频流媒体" };
     }
+    if (!item) return;
+
+    recordNetworkStream(details.tabId, item).then((added) => {
+      if (added) scheduleAutoSniffPush(details.tabId);
+    });
   },
   { urls: ["<all_urls>"] }
 );
 
-// Sniff HLS, video, and audio streams ONLY when user manually enabled sniffing
+// 2. Sniff HLS / DASH / video / audio / octet-stream media / attachment via response headers
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    if (!sniffEnabled) return;
     if (details.tabId < 0 || !details.responseHeaders) return;
     let contentType = "";
     let contentLength = null;
+    let contentRangeTotal = null;
+    let contentDisposition = "";
     for (const h of details.responseHeaders) {
       if (!h.name || !h.value) continue;
       const name = h.name.toLowerCase();
@@ -189,62 +273,88 @@ chrome.webRequest.onHeadersReceived.addListener(
       } else if (name === "content-length") {
         const parsed = parseInt(h.value, 10);
         if (!Number.isNaN(parsed) && parsed > 0) contentLength = parsed;
+      } else if (name === "content-range") {
+        const m = h.value.match(/\/(\d+)\s*$/);
+        if (m && m[1]) {
+          const total = parseInt(m[1], 10);
+          if (!Number.isNaN(total) && total > 0) contentRangeTotal = total;
+        }
+      } else if (name === "content-disposition") {
+        contentDisposition = h.value;
       }
     }
+    const effectiveSize = contentRangeTotal !== null ? contentRangeTotal : contentLength;
 
+    const url = details.url || "";
+    const cdName = parseContentDispositionFilename(contentDisposition);
     let kind = null;
     let label = null;
+
     if (
       contentType.includes("application/vnd.apple.mpegurl") ||
       contentType.includes("application/x-mpegurl") ||
       contentType.includes("audio/mpegurl") ||
-      M3U8_URL_RE.test(details.url)
+      M3U8_URL_RE.test(url)
     ) {
       kind = "hls";
       label = "HLS Stream (.m3u8)";
+    } else if (contentType.includes("application/dash+xml") || MPD_URL_RE.test(url)) {
+      kind = "hls";
+      label = "DASH Stream (.mpd)";
     } else if (
       (contentType.startsWith("video/") && !contentType.includes("mp2t")) ||
-      VIDEO_URL_RE.test(details.url)
+      VIDEO_URL_RE.test(url) ||
+      QUERY_VIDEO_HINT_RE.test(url)
     ) {
-      if (contentLength === null || contentLength >= 256 * 1024) {
+      if (effectiveSize === null || effectiveSize >= 128 * 1024) {
         kind = "video";
-        label = "视频流媒体";
+        label = contentType ? `视频 (${contentType.replace("video/", "")})` : "视频流";
       }
-    } else if (contentType.startsWith("audio/") || AUDIO_URL_RE.test(details.url)) {
-      if (contentLength === null || contentLength >= 64 * 1024) {
+    } else if (
+      contentType.startsWith("audio/") ||
+      AUDIO_URL_RE.test(url) ||
+      QUERY_AUDIO_HINT_RE.test(url)
+    ) {
+      if (effectiveSize === null || effectiveSize >= 48 * 1024) {
         kind = "audio";
-        label = "音频资源";
+        label = contentType ? `音频 (${contentType.replace("audio/", "")})` : "音频流";
       }
+    } else if (
+      (contentType === "application/octet-stream" || contentType === "binary/octet-stream") &&
+      effectiveSize !== null &&
+      effectiveSize >= 512 * 1024
+    ) {
+      kind = VIDEO_URL_RE.test(url) ? "video" : "file";
+      label = cdName || "大文件二进制流";
+    } else if (contentDisposition.toLowerCase().includes("attachment") && cdName) {
+      kind = "file";
+      label = cdName;
     }
 
-    if (kind) {
-      const added = recordNetworkStream(details.tabId, {
-        url: details.url,
-        kind,
-        label,
-        mime: contentType || null,
-        file_size: contentLength
-      });
+    if (!kind) return;
+
+    recordNetworkStream(details.tabId, {
+      url,
+      filename: cdName,
+      kind,
+      label,
+      mime: contentType || null,
+      file_size: effectiveSize
+    }).then((added) => {
       if (added) scheduleAutoSniffPush(details.tabId);
-    }
+    });
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  tabSniffedStreams.delete(tabId);
-  tabAutoPoppedUrl.delete(tabId);
-  if (tabAutoTimers.has(tabId)) {
-    clearTimeout(tabAutoTimers.get(tabId));
-    tabAutoTimers.delete(tabId);
-  }
+  clearTabStreams(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" && changeInfo.url) {
-    tabSniffedStreams.delete(tabId);
-    tabAutoPoppedUrl.delete(tabId);
+    clearTabStreams(tabId);
   }
 });
 
@@ -271,7 +381,6 @@ function flashBadge(text, color) {
 
 function registerContextMenus() {
   chrome.contextMenus.removeAll(() => {
-    // 1. Link resource (HTTP / Magnet / Torrent / HLS / eD2k)
     chrome.contextMenus.create({
       id: "siphon-download-link",
       title: "使用 Siphon 下载此链接",
@@ -282,8 +391,6 @@ function registerContextMenus() {
       title: "使用 Siphon 后台静默下载链接",
       contexts: ["link"]
     });
-
-    // 2. Image resource
     chrome.contextMenus.create({
       id: "siphon-download-image",
       title: "使用 Siphon 下载此图片",
@@ -294,8 +401,6 @@ function registerContextMenus() {
       title: "使用 Siphon 后台静默下载图片",
       contexts: ["image"]
     });
-
-    // 3. Video / Audio media resource
     chrome.contextMenus.create({
       id: "siphon-download-media",
       title: "使用 Siphon 下载此音视频",
@@ -306,34 +411,31 @@ function registerContextMenus() {
       title: "使用 Siphon 后台静默下载音视频",
       contexts: ["video", "audio"]
     });
-
-    // 4. Selected text containing URLs, magnet, or ed2k links
     chrome.contextMenus.create({
       id: "siphon-download-selection",
       title: "使用 Siphon 下载选中文本中的链接",
       contexts: ["selection"]
     });
-
-    // 5. Manual explicit sniff of current page into client Sniff Manager window
     chrome.contextMenus.create({
       id: "siphon-sniff-page",
-      title: "使用 Siphon 嗅探当前页资源（独立弹窗管理）",
+      title: "使用 Siphon 嗅探当前页资源（选择性下载窗）",
       contexts: ["page", "frame", "video", "audio"]
     });
   });
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  // Default: download interception ON, resource sniffing OFF (opt-in only)
   chrome.storage.local.set({ enabled: true, sniffEnabled: false });
   sniffEnabled = false;
+  sniffFlagPromise = Promise.resolve(false);
   clearAllSniffCaches();
   registerContextMenus();
   notifySiphonAlive();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  syncSniffFlagFromStorage();
+  sniffFlagPromise = null;
+  ensureSniffFlagLoaded();
   registerContextMenus();
   notifySiphonAlive();
 });
@@ -355,18 +457,47 @@ function extractUrlsFromText(text) {
   return out;
 }
 
+/**
+ * Deep multi-frame sniffer (main frame + ALL iframes):
+ * 1) Live webRequest network streams (persisted in chrome.storage.session)
+ * 2) `performance.getEntriesByType('resource')` — catches streams ALREADY loaded before enabling sniff!
+ * 3) DOM `<video>`, `<audio>`, `<source>`, `<embed>`, `<object>`, `<a href>`, large `<img>`
+ * 4) Inline script/JSON scan for hidden `.m3u8`, `.mpd`, `.mp4`, `.flv`, `magnet:?`, `ed2k://` URLs
+ */
 async function scanTabResources(tabId, mode) {
   if (!tabId) return [];
-  const netSniffed = (tabSniffedStreams.get(tabId) || []).slice();
-  let domItems = [];
+  const netSniffed = (await getTabStreams(tabId)).slice();
+  let frameItems = [];
+
   try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       func: (scanMode) => {
-        const extRe = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|ts|m4v|m3u8|mp3|flac|wav|aac|ogg|m4a|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
+        const extRe = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|f4v|ts|m4s|m4v|m3u8|mpd|mp3|flac|wav|aac|ogg|m4a|opus|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$|&)/i;
+        const m3u8Re = /\.(m3u8|m3u)(\?|$|&)/i;
+        const mpdRe = /\.mpd(\?|$|&)/i;
+        const videoRe = /\.(mp4|mkv|webm|mov|avi|flv|f4v|m4v|m4s)(\?|$|&)/i;
+        const audioRe = /\.(mp3|flac|wav|aac|ogg|m4a|opus)(\?|$|&)/i;
+        const queryVideoRe = /(?:mime_type|mime|format|media_type|type)=(?:video|mp4|flv|webm|m3u8|hls|mpegurl)/i;
+        const queryAudioRe = /(?:mime_type|mime|format|media_type|type)=(?:audio|mp3|m4a|aac|flac|ogg)/i;
+
         const found = [];
         const seen = new Set();
-        const add = (url, kind, label) => {
+        const resolveUrl = (raw) => {
+          if (!raw || typeof raw !== "string") return "";
+          const t = raw.trim();
+          const low = t.toLowerCase();
+          if (low.startsWith("magnet:?") || low.startsWith("ed2k://|file|")) return t;
+          if (low.startsWith("blob:") || low.startsWith("data:") || low.startsWith("javascript:")) return "";
+          try {
+            return new URL(t, location.href).href;
+          } catch (_) {
+            return "";
+          }
+        };
+
+        const add = (rawUrl, kind, label, fileSize = null) => {
+          const url = resolveUrl(rawUrl);
           if (!url) return;
           const low = url.toLowerCase();
           if (
@@ -385,37 +516,109 @@ async function scanTabResources(tabId, mode) {
             kind,
             label: (label || "").trim().slice(0, 80) || null,
             mime: null,
-            file_size: null
+            file_size: typeof fileSize === "number" && fileSize > 0 ? fileSize : null
           });
         };
 
+        // 1. Performance Resource Timing API — recovers streams already loaded before sniffer was opened!
+        try {
+          const entries = performance.getEntriesByType("resource") || [];
+          for (const e of entries) {
+            const u = e.name || "";
+            if (!u || (!u.startsWith("http://") && !u.startsWith("https://"))) continue;
+            const sz = (e.encodedBodySize || e.transferSize || 0) > 0 ? (e.encodedBodySize || e.transferSize) : null;
+            if (m3u8Re.test(u)) {
+              add(u, "hls", "HLS Stream (.m3u8)", sz);
+            } else if (mpdRe.test(u)) {
+              add(u, "hls", "DASH Stream (.mpd)", sz);
+            } else if (videoRe.test(u) || queryVideoRe.test(u)) {
+              if (sz === null || sz >= 64 * 1024) {
+                add(u, "video", "已加载视频流", sz);
+              }
+            } else if (audioRe.test(u) || queryAudioRe.test(u)) {
+              if (sz === null || sz >= 32 * 1024) {
+                add(u, "audio", "已加载音频流", sz);
+              }
+            } else if (e.initiatorType === "video" || e.initiatorType === "audio") {
+              add(u, e.initiatorType, "媒体请求", sz);
+            }
+          }
+        } catch (_) {}
+
+        // 2. DOM <video>, <audio>, <source>, <embed>, <object>
         document.querySelectorAll("video, audio").forEach((el) => {
           const kind = el.tagName.toLowerCase();
-          if (el.currentSrc) add(el.currentSrc, kind, el.getAttribute("title") || kind);
-          if (el.src) add(el.src, kind, el.getAttribute("title") || kind);
+          const title = el.getAttribute("title") || el.getAttribute("aria-label") || kind;
+          if (el.currentSrc) add(el.currentSrc, kind, title);
+          if (el.src) add(el.src, kind, title);
+          if (el.dataset && el.dataset.src) add(el.dataset.src, kind, title);
           el.querySelectorAll("source").forEach((src) => {
-            if (src.src) add(src.src, kind, src.type || kind);
+            const u = src.src || src.getAttribute("src") || (src.dataset && src.dataset.src);
+            if (u) {
+              const k = m3u8Re.test(u) || mpdRe.test(u) ? "hls" : kind;
+              add(u, k, src.type || title);
+            }
           });
         });
+
+        document.querySelectorAll("embed[src], object[data]").forEach((el) => {
+          const u = el.getAttribute("src") || el.getAttribute("data");
+          if (u && (extRe.test(u) || m3u8Re.test(u))) {
+            add(u, m3u8Re.test(u) ? "hls" : "video", "嵌入媒体");
+          }
+        });
+
+        // 3. Inline script/JSON player config scan (catches escaped https:\/\/...m3u8 / mp4 / magnet / ed2k!)
+        try {
+          let blobText = "";
+          const scripts = document.querySelectorAll("script");
+          for (const s of scripts) {
+            if (!s.src && s.textContent) {
+              blobText += s.textContent + "\n";
+              if (blobText.length > 400000) break;
+            }
+          }
+          if (blobText.length > 0) {
+            const unescaped = blobText.replace(/\\\//g, "/").replace(/\\u002F/gi, "/").replace(/\\u0026/gi, "&");
+            const mediaMatches = unescaped.match(/https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mpd|mp4|flv|webm|mkv|mp3|m4a|flac)(?:\?[^\s"'<>\\]*)?/gi) || [];
+            for (const raw of mediaMatches.slice(0, 40)) {
+              const k = m3u8Re.test(raw) || mpdRe.test(raw)
+                ? "hls"
+                : audioRe.test(raw)
+                  ? "audio"
+                  : "video";
+              add(raw, k, k === "hls" ? "页面脚本 HLS 流" : "页面脚本媒体");
+            }
+            const p2pMatches = unescaped.match(/(?:magnet:\?[^\s"'<>\\]+|ed2k:\/\/\|file\|[^\s"'<>\\]+)/gi) || [];
+            for (const raw of p2pMatches.slice(0, 30)) {
+              add(raw, raw.toLowerCase().startsWith("magnet:?") ? "magnet" : "ed2k", "页面内嵌资源");
+            }
+          }
+        } catch (_) {}
 
         if (scanMode === "media") {
           return found;
         }
 
+        // 4. Downloadable <a href> links, magnets, ed2k, torrents
         document.querySelectorAll("a[href]").forEach((a) => {
-          const href = a.href;
+          const href = a.href || a.getAttribute("href");
           if (!href) return;
           const low = href.toLowerCase();
           if (low.startsWith("magnet:?")) {
-            add(href, "magnet", a.textContent || "Magnet Link");
+            add(href, "magnet", a.textContent || "Magnet 磁力");
           } else if (low.startsWith("ed2k://|file|")) {
-            add(href, "ed2k", a.textContent || "eD2k Link");
+            add(href, "ed2k", a.textContent || "eD2k 电驴");
           } else if (a.hasAttribute("download") || extRe.test(href)) {
-            const kind = /\.m3u8(\?|$)/i.test(href)
+            const kind = m3u8Re.test(href) || mpdRe.test(href)
               ? "hls"
               : /\.torrent(\?|$)/i.test(href)
                 ? "torrent"
-                : "file";
+                : videoRe.test(href)
+                  ? "video"
+                  : audioRe.test(href)
+                    ? "audio"
+                    : "file";
             add(href, kind, a.getAttribute("download") || a.textContent || "");
           }
         });
@@ -428,24 +631,45 @@ async function scanTabResources(tabId, mode) {
           });
         }
 
-        return found.slice(0, 80);
+        return found.slice(0, 100);
       },
       args: [mode]
     });
-    domItems = (results && results[0] && Array.isArray(results[0].result)) ? results[0].result : [];
-  } catch (_) {
-    domItems = [];
-  }
+
+    if (Array.isArray(results)) {
+      for (const frameRes of results) {
+        if (frameRes && Array.isArray(frameRes.result)) {
+          frameItems.push(...frameRes.result);
+        }
+      }
+    }
+  } catch (_) {}
+
+  // Priority order: HLS -> Video -> Audio -> Magnet/Torrent/eD2k -> File -> Image
+  const priority = (k) => {
+    switch ((k || "").toLowerCase()) {
+      case "hls": return 0;
+      case "video": return 1;
+      case "audio": return 2;
+      case "magnet":
+      case "torrent":
+      case "ed2k": return 3;
+      case "file": return 4;
+      default: return 5;
+    }
+  };
 
   const merged = [];
   const seen = new Set();
-  for (const item of [...netSniffed, ...domItems]) {
+  for (const item of [...netSniffed, ...frameItems]) {
+    if (!item || !item.url) continue;
     if (!seen.has(item.url)) {
       seen.add(item.url);
       merged.push(item);
     }
   }
-  return merged.slice(0, 120);
+  merged.sort((a, b) => priority(a.kind) - priority(b.kind));
+  return merged.slice(0, 160);
 }
 
 // Handle messages from popup.js
@@ -593,7 +817,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
           ? "magnet"
           : u.toLowerCase().startsWith("ed2k://")
             ? "ed2k"
-            : /\.m3u8(\?|$)/i.test(u)
+            : M3U8_URL_RE.test(u) || MPD_URL_RE.test(u)
               ? "hls"
               : "file",
         label: null,
@@ -685,7 +909,6 @@ async function sendToSiphon({ url, filename, referrer, mime, fileSize, silent = 
     silent: Boolean(silent)
   };
 
-  // 1. Fast path: local HTTP bridge when Siphon is already running
   try {
     const resp = await fetch(`${SIPHON_ENDPOINT}/api/capture`, {
       method: "POST",
@@ -697,7 +920,6 @@ async function sendToSiphon({ url, filename, referrer, mime, fileSize, silent = 
       return Boolean(data && data.ok && data.captured);
     }
   } catch (_) {
-    // Client not running -> auto-launch via Native Messaging Host on download!
     const nativeReply = await sendNativeToSiphon({
       type: "browser_capture",
       ...payload
@@ -731,7 +953,6 @@ async function sendSniffToSiphon(tab, items, bringToFront = true) {
       return Boolean(data && data.ok);
     }
   } catch (_) {
-    // Explicit/enabled sniff action when client is closed -> auto-launch client and open Sniff Manager
     const nativeReply = await sendNativeToSiphon({
       type: "browser_sniff",
       ...payload
