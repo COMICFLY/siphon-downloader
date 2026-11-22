@@ -430,10 +430,14 @@ fn task_row<'a>(
         .width(Length::Fill)
         .align_y(Alignment::Center);
 
-    if matches!(task.protocol, ProtocolKind::Hls | ProtocolKind::BitTorrent) {
+    if matches!(
+        task.protocol,
+        ProtocolKind::Hls | ProtocolKind::BitTorrent | ProtocolKind::Ed2k
+    ) {
         let (badge_txt, badge_fg, badge_bg) = match task.protocol {
             ProtocolKind::Hls => ("HLS", palette.ok, palette.ok_soft),
             ProtocolKind::BitTorrent => ("BT", palette.warn, palette.warn_soft),
+            ProtocolKind::Ed2k => ("eD2k", palette.accent, palette.accent_soft),
             _ => unreachable!(),
         };
         meta_row = meta_row.push(

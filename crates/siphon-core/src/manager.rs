@@ -209,10 +209,13 @@ impl DownloadManager {
             .ok_or_else(|| SiphonError::UnsupportedProtocol(url.to_string()))
     }
 
-    fn normalize_input_url(raw: &str) -> Result<(String, Url)> {
+    fn normalize_input_url(raw: &str) -> Result<(String, Option<Url>)> {
         let trimmed = raw.trim().trim_matches('"');
+        if trimmed.to_ascii_lowercase().starts_with("ed2k://|") {
+            return Ok((trimmed.to_string(), None));
+        }
         if let Ok(u) = Url::parse(trimmed) {
-            return Ok((trimmed.to_string(), u));
+            return Ok((trimmed.to_string(), Some(u)));
         }
         // Allow local `.torrent` file paths cleanly by turning them into `file://` URLs
         let p = Path::new(trimmed);
@@ -221,7 +224,7 @@ impl DownloadManager {
             .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
             && let Ok(u) = Url::from_file_path(p)
         {
-            return Ok((u.to_string(), u));
+            return Ok((u.to_string(), Some(u)));
         }
         Err(SiphonError::InvalidUrl(trimmed.to_string()))
     }
@@ -350,7 +353,7 @@ impl DownloadManager {
             .filename
             .clone()
             .or_else(|| resolved.filename.clone())
-            .unwrap_or_else(|| infer_filename_from_url(&parsed));
+            .unwrap_or_else(|| infer_filename_from_raw_url(&resolved.url, parsed.as_ref()));
         let initial_filename = sanitize_filename(&fallback_name);
         let initial_category = FileCategory::from_filename_and_mime(&initial_filename, None);
         let domain = Url::parse(&resolved.url)
@@ -696,6 +699,8 @@ impl DownloadManager {
             proxy_url: cfg.proxy_url.clone(),
             user_agent: cfg.user_agent.clone(),
             live_max_connections: live_connections,
+            bt_config: cfg.bt.clone(),
+            ed2k_config: cfg.ed2k.clone(),
         };
 
         let mgr_updates = Arc::clone(self);
@@ -897,6 +902,28 @@ impl DownloadManager {
             link_expired,
         });
     }
+}
+
+pub fn infer_filename_from_raw_url(raw: &str, parsed: Option<&Url>) -> String {
+    let trimmed = raw.trim();
+    if trimmed.to_ascii_lowercase().starts_with("ed2k://|file|") {
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        if parts.len() >= 5 && !parts[2].trim().is_empty() {
+            let decoded = percent_encoding::percent_decode_str(parts[2]).decode_utf8_lossy();
+            let clean = decoded.trim();
+            if !clean.is_empty() {
+                return clean.to_string();
+            }
+        }
+        return format!("ed2k_{}.bin", Utc::now().format("%Y%m%d_%H%M%S"));
+    }
+    if let Some(u) = parsed {
+        return infer_filename_from_url(u);
+    }
+    if let Ok(u) = Url::parse(trimmed) {
+        return infer_filename_from_url(&u);
+    }
+    format!("download_{}.bin", Utc::now().format("%Y%m%d_%H%M%S"))
 }
 
 pub fn infer_filename_from_url(url: &Url) -> String {

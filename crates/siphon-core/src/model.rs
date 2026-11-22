@@ -12,6 +12,7 @@ pub enum ProtocolKind {
     Http,
     Hls,
     BitTorrent,
+    Ed2k,
     Custom(String),
 }
 
@@ -21,6 +22,7 @@ impl ProtocolKind {
             Self::Http => "http",
             Self::Hls => "hls",
             Self::BitTorrent => "bittorrent",
+            Self::Ed2k => "ed2k",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -30,6 +32,7 @@ impl ProtocolKind {
             "http" => Self::Http,
             "hls" => Self::Hls,
             "bittorrent" => Self::BitTorrent,
+            "ed2k" => Self::Ed2k,
             other => Self::Custom(other.to_string()),
         }
     }
@@ -346,6 +349,13 @@ impl DownloadTask {
     }
 
     pub fn domain(&self) -> String {
+        let low = self.original_url.trim().to_ascii_lowercase();
+        if low.starts_with("ed2k://") {
+            return "ed2k".to_string();
+        }
+        if low.starts_with("magnet:?") {
+            return "magnet".to_string();
+        }
         url::Url::parse(&self.resolved_url)
             .or_else(|_| url::Url::parse(&self.original_url))
             .ok()

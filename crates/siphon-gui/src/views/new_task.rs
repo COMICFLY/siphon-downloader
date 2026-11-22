@@ -196,7 +196,7 @@ pub fn view<'a>(modal: &'a NewTaskModalState, palette: SiphonPalette) -> Element
                 .style(input_style(palette)),
                 InputTarget::ModalBatchUrls,
             ),
-            text("支持 [001-100]、[1-20:2] 步长、[a-z] 字母通配符与多通配符笛卡尔展开，同时支持 HTTP / HLS (.m3u8) / Magnet")
+            text("支持 [001-100]、[1-20:2] 步长、[a-z] 字母通配符与多通配符笛卡尔展开，同时支持 HTTP / HLS (.m3u8) / Magnet / eD2k")
                 .size(11)
                 .font(FONT_REGULAR)
                 .color(palette.text_muted),
@@ -339,14 +339,14 @@ pub fn view<'a>(modal: &'a NewTaskModalState, palette: SiphonPalette) -> Element
             .on_press(Message::ModalPickTorrentFile);
 
         let url_row = column![
-            text("下载链接（支持 HTTP/HTTPS · HLS .m3u8 · Magnet 磁力 · 本地 .torrent）")
+            text("下载链接（支持 HTTP/HTTPS · HLS .m3u8 · Magnet 磁力 · 本地 .torrent · eD2k 电驴）")
                 .size(12)
                 .font(FONT_MEDIUM)
                 .color(palette.text_secondary),
             row![
                 wrap_input(
                     text_input(
-                        "https://example.com/archive.zip · .m3u8 · magnet:?xt=...",
+                        "https://... · .m3u8 · magnet:?xt=... · ed2k://|file|...",
                         &modal.url
                     )
                     .id(modal_url_id())

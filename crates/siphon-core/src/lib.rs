@@ -11,12 +11,16 @@ pub mod storage;
 
 pub use batch::{BatchExpandResult, MAX_BATCH_URLS, expand_batch_input};
 pub use config::{
-    AppConfig, Language, ListDensity, QueueCompleteAction, ScheduleConfig, ThemeMode,
-    is_time_in_window, parse_hhmm,
+    AppConfig, BtConfig, Ed2kConfig, Ed2kServerEntry, Language, ListDensity, QueueCompleteAction,
+    ScheduleConfig, ThemeMode, default_ed2k_servers, default_tracker_subscribe_urls,
+    is_time_in_window, parse_hhmm, parse_tracker_list,
 };
 pub use error::{Result, SiphonError};
 pub use limiter::{HierarchicalLimiter, TokenBucket};
-pub use manager::{DownloadManager, deduplicate_filename, infer_filename_from_url, sanitize_filename};
+pub use manager::{
+    DownloadManager, deduplicate_filename, infer_filename_from_raw_url, infer_filename_from_url,
+    sanitize_filename,
+};
 pub use model::{
     ChecksumSpec, DownloadTask, FileCategory, HashAlgorithm, NewTaskRequest, ProbeMetadata,
     ProbePreview, ProtocolKind, SegmentInfo, SegmentState, SpeedSample, TaskEvent, TaskId,

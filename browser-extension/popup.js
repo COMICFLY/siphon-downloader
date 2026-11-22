@@ -90,7 +90,12 @@ function loadPageResources() {
 sendBtn.addEventListener("click", async () => {
   const url = urlInput.value.trim();
   const low = url.toLowerCase();
-  if (!low.startsWith("http://") && !low.startsWith("https://") && !low.startsWith("magnet:?")) {
+  if (
+    !low.startsWith("http://") &&
+    !low.startsWith("https://") &&
+    !low.startsWith("magnet:?") &&
+    !low.startsWith("ed2k://|file|")
+  ) {
     return;
   }
   chrome.runtime.sendMessage(

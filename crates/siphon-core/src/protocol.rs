@@ -1,3 +1,4 @@
+use crate::config::{BtConfig, Ed2kConfig};
 use crate::error::Result;
 use crate::limiter::HierarchicalLimiter;
 use crate::model::{DownloadTask, ProbeMetadata, ProtocolKind, SegmentInfo, TaskLogEntry};
@@ -37,6 +38,8 @@ pub struct DownloadContext {
     pub proxy_url: Option<String>,
     pub user_agent: String,
     pub live_max_connections: Arc<AtomicU32>,
+    pub bt_config: BtConfig,
+    pub ed2k_config: Ed2kConfig,
 }
 
 /// Extensible protocol engine trait.

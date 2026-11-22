@@ -1,7 +1,9 @@
 pub mod about_view;
+pub mod bt_view;
 pub mod capture_popup;
 pub mod delete_confirm;
 pub mod download_popup;
+pub mod ed2k_view;
 pub mod ext_install_modal;
 pub mod inspector;
 pub mod new_task;

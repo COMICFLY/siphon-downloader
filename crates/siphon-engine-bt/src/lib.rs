@@ -1,23 +1,180 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
+use librqbit::{
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig,
+    ListenerOptions, PeerConnectionOptions, Session, SessionOptions,
+};
 use percent_encoding::percent_decode_str;
 use siphon_core::{
-    DownloadContext, DownloadOutcome, EngineUpdate, FileCategory, ProbeMetadata, ProtocolHandler,
-    ProtocolKind, Result, SegmentInfo, SegmentState, SiphonError, TaskLogEntry,
+    BtConfig, DownloadContext, DownloadOutcome, EngineUpdate, FileCategory, ProbeMetadata,
+    ProtocolHandler, ProtocolKind, Result, SegmentInfo, SegmentState, SiphonError, TaskLogEntry,
+    parse_tracker_list,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
-/// Pure-Rust BitTorrent / Magnet download engine powered by `librqbit`.
+/// Pure-Rust BitTorrent / Magnet download engine powered by `librqbit`,
+/// with full custom tracker injection, subscription sync, DHT/LSD/UPnP and port controls.
 #[derive(Debug, Default)]
 pub struct BitTorrentEngine;
 
 impl BitTorrentEngine {
     pub fn new() -> Self {
         Self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackerSyncReport {
+    pub trackers: Vec<String>,
+    pub sources_succeeded: usize,
+    pub sources_failed: usize,
+}
+
+/// Download and merge public BitTorrent tracker lists from one or more HTTP/HTTPS subscription URLs.
+pub async fn sync_trackers_from_urls(
+    urls: &[String],
+    proxy_url: Option<&str>,
+) -> std::result::Result<TrackerSyncReport, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(format!("Siphon/{}", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = proxy_url
+        && !proxy.trim().is_empty()
+        && let Ok(p) = reqwest::Proxy::all(proxy.trim())
+    {
+        builder = builder.proxy(p);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))?;
+
+    let mut combined_raw = String::new();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut last_err = String::new();
+
+    for raw_url in urls {
+        let trimmed = raw_url.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match client.get(trimmed).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(body) => {
+                    combined_raw.push_str(&body);
+                    combined_raw.push('\n');
+                    succeeded += 1;
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_err = e.to_string();
+                }
+            },
+            Ok(resp) => {
+                failed += 1;
+                last_err = format!("HTTP {}", resp.status());
+            }
+            Err(e) => {
+                failed += 1;
+                last_err = e.to_string();
+            }
+        }
+    }
+
+    if succeeded == 0 {
+        return Err(if last_err.is_empty() {
+            "未提供有效的 Tracker 订阅源地址".to_string()
+        } else {
+            format!("同步 Tracker 订阅源失败: {last_err}")
+        });
+    }
+
+    let trackers = parse_tracker_list(&combined_raw);
+    Ok(TrackerSyncReport {
+        trackers,
+        sources_succeeded: succeeded,
+        sources_failed: failed,
+    })
+}
+
+/// Build `librqbit::SessionOptions` directly from Siphon's `BtConfig` + optional proxy URL.
+pub fn build_session_options(bt: &BtConfig, proxy_url: Option<&str>) -> SessionOptions {
+    let dht = if bt.enable_dht {
+        Some(DhtSessionConfig {
+            persistence: None,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    let listen = if bt.listen_port > 0 || bt.enable_upnp {
+        Some(ListenerOptions {
+            listen_addr: (Ipv4Addr::UNSPECIFIED, bt.listen_port).into(),
+            enable_upnp_port_forwarding: bt.enable_upnp,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    let socks_proxy = proxy_url
+        .map(str::trim)
+        .filter(|p| p.to_ascii_lowercase().starts_with("socks5://"))
+        .map(str::to_string);
+
+    let connect = Some(ConnectionOptions {
+        enable_tcp: true,
+        proxy_url: socks_proxy,
+        peer_opts: Some(PeerConnectionOptions {
+            connect_timeout: Some(Duration::from_secs(bt.peer_connect_timeout_secs.clamp(3, 60))),
+            ..Default::default()
+        }),
+    });
+
+    let mut trackers = HashSet::new();
+    if bt.auto_append_trackers && !bt.disable_trackers {
+        for raw in bt.effective_trackers() {
+            if let Ok(u) = Url::parse(&raw) {
+                trackers.insert(u);
+            }
+        }
+    }
+
+    SessionOptions {
+        dht,
+        disable_trackers: bt.disable_trackers,
+        disable_local_service_discovery: !bt.enable_lsd,
+        fastresume: false,
+        persistence: None,
+        listen,
+        connect,
+        trackers,
+        peer_limit: Some(bt.max_peers_per_torrent.clamp(10, 500)),
+        client_name_and_version: Some(format!("Siphon/{}", env!("CARGO_PKG_VERSION"))),
+        ..Default::default()
+    }
+}
+
+/// Build `librqbit::AddTorrentOptions` with custom/synced trackers injected when enabled.
+pub fn build_add_torrent_options(bt: &BtConfig) -> AddTorrentOptions {
+    let trackers = if bt.auto_append_trackers && !bt.disable_trackers {
+        let list = bt.effective_trackers();
+        if list.is_empty() { None } else { Some(list) }
+    } else {
+        None
+    };
+
+    AddTorrentOptions {
+        overwrite: true,
+        disable_trackers: bt.disable_trackers,
+        peer_limit: Some(bt.max_peers_per_torrent.clamp(10, 500)),
+        trackers,
+        ..Default::default()
     }
 }
 
@@ -155,17 +312,20 @@ impl ProtocolHandler for BitTorrentEngine {
         let output_dir = ctx.task.save_dir.clone();
         tokio::fs::create_dir_all(&output_dir).await?;
 
+        let opts = build_session_options(&ctx.bt_config, ctx.proxy_url.as_deref());
+        let tracker_count = opts.trackers.len();
         push_log(
             &ctx,
             "info",
-            format!("正在初始化 BitTorrent DHT/Peer 会话 -> {}", output_dir.display()),
+            format!(
+                "初始化 BitTorrent 会话（DHT={}, LSD={}, UPnP={}, 注入自定义 Tracker={} 个）-> {}",
+                ctx.bt_config.enable_dht,
+                ctx.bt_config.enable_lsd,
+                ctx.bt_config.enable_upnp,
+                tracker_count,
+                output_dir.display()
+            ),
         );
-
-        let opts = SessionOptions {
-            persistence: None,
-            fastresume: false,
-            ..Default::default()
-        };
 
         let session = Session::new_with_opts(output_dir.clone(), opts)
             .await
@@ -184,10 +344,7 @@ impl ProtocolHandler for BitTorrentEngine {
             AddTorrent::from_url(&raw_url)
         };
 
-        let add_opts = AddTorrentOptions {
-            overwrite: true,
-            ..Default::default()
-        };
+        let add_opts = build_add_torrent_options(&ctx.bt_config);
 
         let response = tokio::select! {
             _ = ctx.cancel.cancelled() => {
@@ -368,6 +525,9 @@ fn build_bt_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::routing::get;
+    use tokio::net::TcpListener;
 
     #[test]
     fn recognizes_magnet_and_torrent_urls() {
@@ -379,6 +539,7 @@ mod tests {
         assert!(engine.supports_url("file:///C:/Users/Test/Downloads/sample.torrent"));
         assert!(!engine.supports_url("https://example.com/file.zip"));
         assert!(!engine.supports_url("https://example.com/playlist.m3u8"));
+        assert!(!engine.supports_url("ed2k://|file|test.iso|1024|31D6CFE0D16AE931B73C59D7E0C089C0|/"));
     }
 
     #[tokio::test]
@@ -396,5 +557,84 @@ mod tests {
         assert_eq!(meta.filename, "Ubuntu 24.04.2 Desktop.iso");
         assert!(meta.supports_range);
         assert_eq!(meta.suggested_category, FileCategory::DiskImage);
+    }
+
+    #[test]
+    fn build_session_and_add_options_applies_custom_trackers_and_network_flags() {
+        let bt = BtConfig {
+            enable_dht: false,
+            enable_lsd: false,
+            enable_upnp: true,
+            disable_trackers: false,
+            listen_port: 6889,
+            peer_connect_timeout_secs: 15,
+            max_peers_per_torrent: 200,
+            auto_append_trackers: true,
+            custom_trackers: vec![
+                "udp://tracker.example.org:1337/announce".into(),
+                "https://tracker.example.net/announce".into(),
+            ],
+            synced_trackers: vec![
+                "udp://tracker.example.org:1337/announce".into(), // duplicate
+                "udp://synced.example.com:80/announce".into(),
+            ],
+            ..Default::default()
+        };
+
+        let sess = build_session_options(&bt, Some("socks5://127.0.0.1:1080"));
+        assert!(sess.dht.is_none());
+        assert!(sess.disable_local_service_discovery);
+        assert_eq!(sess.peer_limit, Some(200));
+        assert_eq!(sess.trackers.len(), 3);
+        let listen = sess.listen.expect("listen options present");
+        assert_eq!(listen.listen_addr.port(), 6889);
+        assert!(listen.enable_upnp_port_forwarding);
+        assert_eq!(
+            sess.connect.as_ref().and_then(|c| c.proxy_url.as_deref()),
+            Some("socks5://127.0.0.1:1080")
+        );
+
+        let add = build_add_torrent_options(&bt);
+        let list = add.trackers.expect("trackers injected");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], "udp://tracker.example.org:1337/announce");
+        assert_eq!(list[2], "udp://synced.example.com:80/announce");
+    }
+
+    #[tokio::test]
+    async fn sync_trackers_from_local_http_subscription_deduplicates_and_handles_partial_failure() {
+        let list_a = "# Best Trackers\nudp://t1.example:1337/announce\nhttps://t2.example/announce\n";
+        let list_b = "https://t2.example/announce\nudp://t3.example:6969/announce\ninvalid_line\n";
+        let app = Router::new()
+            .route("/best.txt", get(move || async move { list_a }))
+            .route("/extra.txt", get(move || async move { list_b }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let report = sync_trackers_from_urls(
+            &[
+                format!("http://{addr}/best.txt"),
+                format!("http://{addr}/extra.txt"),
+                format!("http://{addr}/missing-404.txt"),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.sources_succeeded, 2);
+        assert_eq!(report.sources_failed, 1);
+        assert_eq!(
+            report.trackers,
+            vec![
+                "udp://t1.example:1337/announce",
+                "https://t2.example/announce",
+                "udp://t3.example:6969/announce",
+            ]
+        );
     }
 }

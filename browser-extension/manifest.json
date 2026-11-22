@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Siphon Download Capture",
-  "version": "0.3.0",
-  "description": "自动接管 Chrome / Edge 浏览器下载，支持 HLS (.m3u8) 流媒体实时嗅探、磁力链接、右键任意资源与页面批量提交至 Siphon 多线程下载器",
+  "version": "0.4.0",
+  "description": "自动接管 Chrome / Edge 浏览器下载，支持 HLS (.m3u8) 流媒体实时嗅探、Magnet 磁力、eD2k 电驴链接、右键任意资源与页面批量提交至 Siphon",
   "permissions": [
     "downloads",
     "cookies",

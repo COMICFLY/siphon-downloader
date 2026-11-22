@@ -6,11 +6,11 @@
 
 <p align="center">
   <strong>纯 Rust 构建的 Windows 11 高性能多协议多线程下载器</strong><br/>
-  HTTP 动态二分借片 · HLS (.m3u8) 流媒体嗅探合并 · BitTorrent / 磁力引擎 · 计划调度与批量队列 · 独立悬浮捕获小窗
+  HTTP 动态二分借片 · HLS (.m3u8) 嗅探合并 · BitTorrent / 自定义 Tracker · eD2k 电驴 · 计划调度与批量队列
 </p>
 
 <p align="center">
-  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.3.0-38BDF8?style=flat-square" alt="Release" /></a>
+  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.4.0-38BDF8?style=flat-square" alt="Release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-0EA5E9?style=flat-square" alt="Platform" />
   <img src="https://img.shields.io/badge/language-Rust%202024-F97316?style=flat-square" alt="Rust" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="License" /></a>
@@ -30,10 +30,11 @@
 
 ## 主要功能
 
-### 1. 高性能纯 Rust 多协议下载引擎（HTTP / HLS / BitTorrent）
+### 1. 高性能纯 Rust 多协议下载引擎（HTTP / HLS / BitTorrent / eD2k）
 - **HTTP/HTTPS 真多线程并发引擎**：基于独立 HTTP/1.1 TCP 并发连接与 `TCP_NODELAY`，避免 HTTP/2 单连接流控瓶颈，充分跑满千兆宽带（实测单任务峰值突破 `130 MB/s`）；内置**动态二分借片（Dynamic Work Stealing）**、**256 KB 写缓冲合并落盘**、SQLite 分片断点续传、过期直链无缝替换、分级令牌桶限速与 **SHA-256 / MD5 / BLAKE3** 哈希校验。
 - **HLS（`.m3u8`）流媒体引擎**：原生纯 Rust 解析 Master / Media 播放列表（自动选择最高码率流），支持 **AES-128-CBC 分片实时解密**、并发分片拉取与断点续传、按序无损合并输出。
-- **BitTorrent / Magnet 协议引擎**：基于纯 Rust `librqbit` 驱动，直接支持 `magnet:?` 磁力链接、`.torrent` 远端直链、以及本地 `.torrent` 种子文件拖拽或一键导入，自动启用 DHT 与节点调度。
+- **BitTorrent / Magnet 协议与独立「BT / Tracker」菜单**：基于纯 Rust `librqbit` 驱动，支持 `magnet:?` 磁力链接、`.torrent` 远端直链与本地 `.torrent` 种子文件拖拽/导入；独立 **BT / Tracker** 页面提供 DHT / LSD / UPnP / 监听端口 / 最大 Peer / 连接超时设置、**自定义 Tracker 批量增删与剪贴板导入**，以及**公共 Tracker 订阅源一键同步与启动自动刷新**。
+- **eD2k 电驴协议与独立「eD2k 电驴」菜单**：原生纯 Rust 实现 `ed2k://|file|...` 链接解析、9,728,000 字节分块 **RFC 1320 MD4 完整性校验**、标准二进制 `server.met` 服务器列表订阅解析与节点 TCP 实时连通测速；独立 **eD2k 电驴** 页面提供昵称、TCP/Kad UDP 端口、Kad 网络、协议加密混淆、来源数/上传限速与服务器节点管理。
 
 ### 2. 计划调度、完成动作与批量通配符队列
 - **计划调度与下载完成动作（Scheduler）**：支持每日**定时自动开始/暂停下载队列**、**分时段自动全局限速**（支持跨午夜时段，离开时段后自动恢复默认限速），以及队列全部下载完成后自动执行 **退出软件 / 系统睡眠 / 系统休眠 / 30 秒倒计时关机 / 自定义 PowerShell 脚本**（默认开启单次触发自动重置保护）。
@@ -84,11 +85,11 @@
 
 前往 [**GitHub Releases**](https://github.com/COMICFLY/siphon-downloader/releases) 下载对应文件：
 
-1. **`Siphon-Setup-0.3.0-x64.exe`（推荐）**：标准 Windows 安装包
+1. **`Siphon-Setup-0.4.0-x64.exe`（推荐）**：标准 Windows 安装包
    - 支持自由选择**程序安装目录**与**数据存储目录**；
    - 支持勾选创建桌面快捷方式与**开机静默启动**；
-   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.3.0.zip` 扩展压缩包。
-2. **`siphon-browser-extension-v0.3.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
+   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.4.0.zip` 扩展压缩包。
+2. **`siphon-browser-extension-v0.4.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
    - 解压后打开浏览器的 `chrome://extensions` 或 `edge://extensions`；
    - 开启右上角 **「开发者模式」**，将解压出的文件夹直接拖入浏览器扩展页即可完成加载。
 

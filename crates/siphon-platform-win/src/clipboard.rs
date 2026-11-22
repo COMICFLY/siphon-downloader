@@ -27,7 +27,8 @@ pub fn extract_downloadable_url(raw: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.len() > 2048 || trimmed.contains('\n') || trimmed.contains(' ') {
         return None;
     }
-    if trimmed.to_ascii_lowercase().starts_with("magnet:?") {
+    let low = trimmed.to_ascii_lowercase();
+    if low.starts_with("magnet:?") || low.starts_with("ed2k://|file|") {
         return Some(trimmed.to_string());
     }
     let parsed = url::Url::parse(trimmed).ok()?;
@@ -174,6 +175,14 @@ mod tests {
         assert_eq!(
             extract_downloadable_url("https://github.com/org/repo/releases/download/v1.0/app"),
             Some("https://github.com/org/repo/releases/download/v1.0/app".to_string())
+        );
+        assert_eq!(
+            extract_downloadable_url("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"),
+            Some("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+        assert_eq!(
+            extract_downloadable_url("ed2k://|file|Ubuntu.iso|1048576|31D6CFE0D16AE931B73C59D7E0C089C0|/"),
+            Some("ed2k://|file|Ubuntu.iso|1048576|31D6CFE0D16AE931B73C59D7E0C089C0|/".to_string())
         );
         assert_eq!(extract_downloadable_url("https://example.com/about"), None);
         assert_eq!(extract_downloadable_url("hello world"), None);

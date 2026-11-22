@@ -1,9 +1,9 @@
 const SIPHON_ENDPOINT = "http://127.0.0.1:16800";
-const CLIENT_VERSION = "chrome-extension/0.3.0";
+const CLIENT_VERSION = "chrome-extension/0.4.0";
 const MIN_INTERCEPT_SIZE = 256 * 1024;
 const CAPTURE_EXT_RE = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|ts|m4v|m3u8|mp3|flac|wav|aac|ogg|m4a|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
 const M3U8_URL_RE = /\.m3u8(\?|$)/i;
-const DOWNLOADABLE_URL_RE = /(?:https?:\/\/[^\s"'<>()\[\]{}]+|magnet:\?[^\s"'<>()\[\]{}]+)/gi;
+const DOWNLOADABLE_URL_RE = /(?:https?:\/\/[^\s"'<>()\[\]{}]+|magnet:\?[^\s"'<>()\[\]{}]+|ed2k:\/\/\|file\|[^\s"'<>()\[\]{}]+)/gi;
 
 // Keep track of download IDs already handled to avoid duplicate capture
 const handledIds = new Set();
@@ -17,10 +17,12 @@ function isHttpUrl(url) {
 
 function isDownloadableUrl(url) {
   if (typeof url !== "string") return false;
+  const low = url.toLowerCase();
   return (
-    url.startsWith("http://") ||
-    url.startsWith("https://") ||
-    url.toLowerCase().startsWith("magnet:?")
+    low.startsWith("http://") ||
+    low.startsWith("https://") ||
+    low.startsWith("magnet:?") ||
+    low.startsWith("ed2k://|file|")
   );
 }
 
@@ -208,7 +210,12 @@ async function scanTabResources(tabId, mode) {
         const add = (url, kind, label) => {
           if (!url) return;
           const low = url.toLowerCase();
-          if (!low.startsWith("http://") && !low.startsWith("https://") && !low.startsWith("magnet:?")) {
+          if (
+            !low.startsWith("http://") &&
+            !low.startsWith("https://") &&
+            !low.startsWith("magnet:?") &&
+            !low.startsWith("ed2k://|file|")
+          ) {
             return;
           }
           if (seen.has(url)) return;
@@ -230,12 +237,15 @@ async function scanTabResources(tabId, mode) {
           return found;
         }
 
-        // Collect downloadable <a href> links, magnets, and torrents
+        // Collect downloadable <a href> links, magnets, ed2k, and torrents
         document.querySelectorAll("a[href]").forEach((a) => {
           const href = a.href;
           if (!href) return;
-          if (href.toLowerCase().startsWith("magnet:?")) {
+          const low = href.toLowerCase();
+          if (low.startsWith("magnet:?")) {
             add(href, "magnet", a.textContent || "Magnet Link");
+          } else if (low.startsWith("ed2k://|file|")) {
+            add(href, "ed2k", a.textContent || "eD2k Link");
           } else if (a.hasAttribute("download") || extRe.test(href)) {
             const kind = /\.m3u8(\?|$)/i.test(href)
               ? "hls"

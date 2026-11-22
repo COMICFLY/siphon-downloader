@@ -13,7 +13,9 @@ url.workspace = true
 percent-encoding.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
 librqbit = { version = "9.1", default-features = false, features = ["default-tls"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

@@ -18,12 +18,17 @@ pub fn extract_urls_from_text(raw: &str) -> Vec<String> {
             .trim()
             .trim_matches(|c| matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']'));
         let low = trimmed.to_ascii_lowercase();
-        if (low.starts_with("http://")
+        let is_valid = if low.starts_with("ed2k://|file|") {
+            true
+        } else if low.starts_with("http://")
             || low.starts_with("https://")
-            || low.starts_with("magnet:?"))
-            && url::Url::parse(trimmed).is_ok()
-            && seen.insert(trimmed.to_string())
+            || low.starts_with("magnet:?")
         {
+            url::Url::parse(trimmed).is_ok()
+        } else {
+            false
+        };
+        if is_valid && seen.insert(trimmed.to_string()) {
             urls.push(trimmed.to_string());
         }
     }
@@ -317,13 +322,14 @@ mod tests {
         assert_eq!(single, vec!["https://example.com/file.zip"]);
 
         let multi = extract_urls_from_text(
-            "Check <https://a.example.com/1.iso> and https://b.example.com/2.zip\nhttps://a.example.com/1.iso",
+            "Check <https://a.example.com/1.iso> and magnet:?xt=urn:btih:abcdef123456 and ed2k://|file|demo.bin|123|31D6CFE0D16AE931B73C59D7E0C089C0|/\nhttps://a.example.com/1.iso",
         );
         assert_eq!(
             multi,
             vec![
                 "https://a.example.com/1.iso",
-                "https://b.example.com/2.zip"
+                "magnet:?xt=urn:btih:abcdef123456",
+                "ed2k://|file|demo.bin|123|31D6CFE0D16AE931B73C59D7E0C089C0|/"
             ]
         );
     }

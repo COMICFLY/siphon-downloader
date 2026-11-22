@@ -71,7 +71,10 @@ pub fn expand_batch_input(raw: &str, filter_expr: &str) -> BatchExpandResult {
 
 fn is_supported_scheme(s: &str) -> bool {
     let low = s.to_ascii_lowercase();
-    low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?")
+    low.starts_with("http://")
+        || low.starts_with("https://")
+        || low.starts_with("magnet:?")
+        || low.starts_with("ed2k://")
 }
 
 fn expand_single_template(tpl: &str, limit: usize) -> Vec<String> {
@@ -247,10 +250,12 @@ mod tests {
             Download: https://a.com/movie.mp4
             Doc: https://a.com/readme.pdf
             magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=test
+            ed2k://|file|Ubuntu.iso|1048576|31D6CFE0D16AE931B73C59D7E0C089C0|/
         "#;
-        let r = expand_batch_input(input, ".mp4, magnet:");
-        assert_eq!(r.urls.len(), 2);
+        let r = expand_batch_input(input, ".mp4, magnet:, ed2k://");
+        assert_eq!(r.urls.len(), 3);
         assert_eq!(r.urls[0], "https://a.com/movie.mp4");
         assert!(r.urls[1].starts_with("magnet:?"));
+        assert!(r.urls[2].starts_with("ed2k://|file|"));
     }
 }

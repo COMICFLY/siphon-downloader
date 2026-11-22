@@ -3,7 +3,7 @@ use crate::icons::{IconKind, icon};
 use crate::state::{
     CaptureAction, CapturePopupState, ContextMenuState, DeleteConfirmState, DownloadPopupState,
     ExtInstallModalState, InputTarget, Message, NavSection, NewTaskModalState, RuleDraft,
-    UpdateCheckStatus,
+    ServerTestStatus, UpdateCheckStatus,
 };
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, SiphonPalette, hairline_rule_style, modal_card_style,
@@ -18,13 +18,17 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Event, Length, Point, Size, Subscription, Task, Theme, stream, window};
 use siphon_core::{
-    AppConfig, AutomationRule, ChecksumSpec, DownloadManager, DownloadTask, ExternalPlugin,
-    FileCategory, HashAlgorithm, NewTaskRequest, QueueCompleteAction, RuleAction, RuleCondition,
-    RuleEngine, RuleEvalInput, TaskEvent, TaskId, TaskSource, TaskStatus, ThemeMode,
-    expand_batch_input, format_speed, infer_filename_from_url, is_time_in_window, parse_hhmm,
+    AppConfig, AutomationRule, ChecksumSpec, DownloadManager, DownloadTask, Ed2kServerEntry,
+    ExternalPlugin, FileCategory, HashAlgorithm, NewTaskRequest, QueueCompleteAction, RuleAction,
+    RuleCondition, RuleEngine, RuleEvalInput, TaskEvent, TaskId, TaskSource, TaskStatus, ThemeMode,
+    default_ed2k_servers, default_tracker_subscribe_urls, expand_batch_input, format_speed,
+    infer_filename_from_raw_url, is_time_in_window, parse_hhmm, parse_tracker_list,
     sanitize_filename,
 };
-use siphon_engine_bt::BitTorrentEngine;
+use siphon_engine_bt::{BitTorrentEngine, sync_trackers_from_urls};
+use siphon_engine_ed2k::{
+    Ed2kEngine, parse_ed2k_server_link, sync_servers_from_met, test_ed2k_server,
+};
 use siphon_engine_hls::HlsEngine;
 use siphon_engine_http::{HttpEngine, check_for_updates};
 use siphon_platform_win::{
@@ -84,6 +88,7 @@ pub fn init_shared_runtime() -> Arc<DownloadManager> {
             vec![
                 Arc::new(HlsEngine::new()),
                 Arc::new(BitTorrentEngine::new()),
+                Arc::new(Ed2kEngine::new()),
                 Arc::new(HttpEngine::new()),
             ],
             extra_plugins,
@@ -173,6 +178,28 @@ pub struct SiphonApp {
     sched_last_stop_day: Option<(i32, u32, u32)>,
     sched_speed_window_active: bool,
 
+    // BitTorrent & Tracker page buffers
+    bt_listen_port_input: String,
+    bt_max_peers_input: String,
+    bt_timeout_input: String,
+    bt_new_tracker_input: String,
+    bt_new_sub_url_input: String,
+    bt_syncing_trackers: bool,
+    bt_sync_status: Option<String>,
+
+    // eD2k page buffers
+    ed2k_tcp_port_input: String,
+    ed2k_udp_port_input: String,
+    ed2k_max_sources_input: String,
+    ed2k_upload_limit_input: String,
+    ed2k_quick_server_link: String,
+    ed2k_new_srv_name: String,
+    ed2k_new_srv_host: String,
+    ed2k_new_srv_port: String,
+    ed2k_syncing_met: bool,
+    ed2k_met_sync_status: Option<String>,
+    ed2k_server_tests: HashMap<String, ServerTestStatus>,
+
     // Settings text input buffers
     save_dir_input: String,
     global_speed_input: String,
@@ -218,6 +245,13 @@ impl SiphonApp {
         let accent_hex_input = config.accent_color.clone();
         let popup_accent_hex_input = config.download_popup_accent.clone();
         let sched_speed_kbps_input = config.schedule.scheduled_speed_limit_kbps.to_string();
+        let bt_listen_port_input = config.bt.listen_port.to_string();
+        let bt_max_peers_input = config.bt.max_peers_per_torrent.to_string();
+        let bt_timeout_input = config.bt.peer_connect_timeout_secs.to_string();
+        let ed2k_tcp_port_input = config.ed2k.tcp_port.to_string();
+        let ed2k_udp_port_input = config.ed2k.udp_port.to_string();
+        let ed2k_max_sources_input = config.ed2k.max_sources_per_file.to_string();
+        let ed2k_upload_limit_input = config.ed2k.upload_limit_kbps.to_string();
 
         let (rgba, w, h) = siphon_platform_win::generate_siphon_icon_rgba();
         let app_icon_handle = image::Handle::from_rgba(w, h, rgba.clone());
@@ -306,6 +340,24 @@ impl SiphonApp {
             sched_last_start_day: None,
             sched_last_stop_day: None,
             sched_speed_window_active: false,
+            bt_listen_port_input,
+            bt_max_peers_input,
+            bt_timeout_input,
+            bt_new_tracker_input: String::new(),
+            bt_new_sub_url_input: String::new(),
+            bt_syncing_trackers: false,
+            bt_sync_status: None,
+            ed2k_tcp_port_input,
+            ed2k_udp_port_input,
+            ed2k_max_sources_input,
+            ed2k_upload_limit_input,
+            ed2k_quick_server_link: String::new(),
+            ed2k_new_srv_name: String::new(),
+            ed2k_new_srv_host: String::new(),
+            ed2k_new_srv_port: "4661".to_string(),
+            ed2k_syncing_met: false,
+            ed2k_met_sync_status: None,
+            ed2k_server_tests: HashMap::new(),
             save_dir_input,
             global_speed_input,
             proxy_input,
@@ -329,7 +381,12 @@ impl SiphonApp {
             let _ = deploy_browser_extension(app.manager.data_dir());
         }
 
-        (app, Task::batch([init_window, init_icons]))
+        let mut boot_tasks = vec![init_window, init_icons];
+        if app.config.bt.auto_sync_trackers_on_start {
+            boot_tasks.push(Task::done(Message::BtSyncTrackers));
+        }
+
+        (app, Task::batch(boot_tasks))
     }
 
     pub fn title(&self, window_id: window::Id) -> String {
@@ -499,8 +556,7 @@ impl SiphonApp {
         let fallback = initial_filename
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .or_else(|| parsed.as_ref().map(infer_filename_from_url))
-            .unwrap_or_else(|| "download.bin".to_string());
+            .unwrap_or_else(|| infer_filename_from_raw_url(url, parsed.as_ref()));
         let filename = sanitize_filename(&fallback);
         let category = FileCategory::from_filename_and_mime(&filename, mime);
         let domain = parsed
@@ -1573,6 +1629,7 @@ impl SiphonApp {
                 if low.starts_with("http://")
                     || low.starts_with("https://")
                     || low.starts_with("magnet:?")
+                    || low.starts_with("ed2k://|file|")
                 {
                     self.quick_input.clear();
                     self.active_nav = NavSection::All;
@@ -2170,6 +2227,428 @@ impl SiphonApp {
                 if !tasks_to_run.is_empty() {
                     return Task::batch(tasks_to_run);
                 }
+            }
+
+            // BitTorrent & Custom Tracker dedicated workspace
+            Message::BtToggleDht(v) => {
+                self.config.bt.enable_dht = v;
+                return self.save_config_async();
+            }
+            Message::BtToggleLsd(v) => {
+                self.config.bt.enable_lsd = v;
+                return self.save_config_async();
+            }
+            Message::BtToggleUpnp(v) => {
+                self.config.bt.enable_upnp = v;
+                return self.save_config_async();
+            }
+            Message::BtToggleDisableTrackers(v) => {
+                self.config.bt.disable_trackers = v;
+                return self.save_config_async();
+            }
+            Message::BtToggleAutoAppend(v) => {
+                self.config.bt.auto_append_trackers = v;
+                return self.save_config_async();
+            }
+            Message::BtToggleAutoSyncOnStart(v) => {
+                self.config.bt.auto_sync_trackers_on_start = v;
+                return self.save_config_async();
+            }
+            Message::BtListenPortChanged(v) => {
+                self.bt_listen_port_input = v;
+            }
+            Message::BtMaxPeersChanged(v) => {
+                self.bt_max_peers_input = v;
+            }
+            Message::BtConnectTimeoutChanged(v) => {
+                self.bt_timeout_input = v;
+            }
+            Message::BtNewTrackerChanged(v) => {
+                self.bt_new_tracker_input = v;
+            }
+            Message::BtAddTracker => {
+                let parsed = parse_tracker_list(&self.bt_new_tracker_input);
+                if parsed.is_empty() {
+                    self.toast = Some(
+                        "请输入有效的 Tracker 地址（支持 udp://、http://、https://、ws://、wss://）"
+                            .to_string(),
+                    );
+                    return Task::none();
+                }
+                let mut added = 0usize;
+                for tr in parsed {
+                    if !self.config.bt.custom_trackers.contains(&tr) {
+                        self.config.bt.custom_trackers.push(tr);
+                        added += 1;
+                    }
+                }
+                self.bt_new_tracker_input.clear();
+                self.toast = Some(if added > 0 {
+                    format!("已添加 {added} 条自定义 Tracker")
+                } else {
+                    "输入的 Tracker 已存在于列表中".to_string()
+                });
+                return self.save_config_async();
+            }
+            Message::BtPasteTrackersClipboard => {
+                let Some(raw) = read_clipboard_text() else {
+                    self.toast = Some("剪贴板为空".to_string());
+                    return Task::none();
+                };
+                let parsed = parse_tracker_list(&raw);
+                if parsed.is_empty() {
+                    self.toast = Some("未在剪贴板内容中检测到有效的 Tracker 地址".to_string());
+                    return Task::none();
+                }
+                let mut added = 0usize;
+                for tr in parsed {
+                    if !self.config.bt.custom_trackers.contains(&tr) {
+                        self.config.bt.custom_trackers.push(tr);
+                        added += 1;
+                    }
+                }
+                self.toast = Some(format!("已从剪贴板导入 {added} 条自定义 Tracker"));
+                return self.save_config_async();
+            }
+            Message::BtRemoveCustomTracker(idx) => {
+                if idx < self.config.bt.custom_trackers.len() {
+                    self.config.bt.custom_trackers.remove(idx);
+                    return self.save_config_async();
+                }
+            }
+            Message::BtClearCustomTrackers => {
+                self.config.bt.custom_trackers.clear();
+                self.toast = Some("已清空自定义 Tracker 列表".to_string());
+                return self.save_config_async();
+            }
+            Message::BtNewSubscribeUrlChanged(v) => {
+                self.bt_new_sub_url_input = v;
+            }
+            Message::BtAddSubscribeUrl => {
+                let u = self.bt_new_sub_url_input.trim().to_string();
+                if !(u.starts_with("http://") || u.starts_with("https://")) {
+                    self.toast = Some("订阅源地址必须以 http:// 或 https:// 开头".to_string());
+                    return Task::none();
+                }
+                if !self.config.bt.tracker_subscribe_urls.contains(&u) {
+                    self.config.bt.tracker_subscribe_urls.push(u);
+                }
+                self.bt_new_sub_url_input.clear();
+                self.toast = Some("已添加公共 Tracker 订阅源".to_string());
+                return self.save_config_async();
+            }
+            Message::BtRemoveSubscribeUrl(idx) => {
+                if idx < self.config.bt.tracker_subscribe_urls.len() {
+                    self.config.bt.tracker_subscribe_urls.remove(idx);
+                    return self.save_config_async();
+                }
+            }
+            Message::BtResetDefaultSubscribeUrls => {
+                self.config.bt.tracker_subscribe_urls = default_tracker_subscribe_urls();
+                self.toast = Some("已恢复默认公共 Tracker 订阅源".to_string());
+                return self.save_config_async();
+            }
+            Message::BtSyncTrackers => {
+                if self.bt_syncing_trackers {
+                    return Task::none();
+                }
+                self.bt_syncing_trackers = true;
+                self.bt_sync_status = Some("正在拉取并去重公共 Tracker 订阅源...".to_string());
+                let urls = self.config.bt.tracker_subscribe_urls.clone();
+                let proxy = self.config.proxy_url.clone();
+                return Task::perform(
+                    async move {
+                        sync_trackers_from_urls(&urls, proxy.as_deref())
+                            .await
+                            .map(|r| (r.trackers, r.sources_succeeded, r.sources_failed))
+                    },
+                    Message::BtSyncTrackersFinished,
+                );
+            }
+            Message::BtSyncTrackersFinished(res) => {
+                self.bt_syncing_trackers = false;
+                match res {
+                    Ok((trackers, ok_cnt, fail_cnt)) => {
+                        let count = trackers.len();
+                        let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+                        self.config.bt.synced_trackers = trackers;
+                        self.config.bt.last_tracker_sync_at = Some(now_ts);
+                        let msg = if fail_cnt > 0 {
+                            format!(
+                                "同步完成：获取 {count} 条去重 Tracker（{ok_cnt} 个源成功，{fail_cnt} 个源失败）"
+                            )
+                        } else {
+                            format!("同步完成：成功从 {ok_cnt} 个订阅源获取 {count} 条活跃 Tracker")
+                        };
+                        self.bt_sync_status = Some(msg.clone());
+                        self.toast = Some(msg);
+                        return self.save_config_async();
+                    }
+                    Err(e) => {
+                        self.bt_sync_status = Some(format!("同步失败：{e}"));
+                        self.toast = Some(format!("同步 Tracker 失败：{e}"));
+                    }
+                }
+            }
+            Message::BtClearSyncedTrackers => {
+                self.config.bt.synced_trackers.clear();
+                self.config.bt.last_tracker_sync_at = None;
+                self.bt_sync_status = Some("已清空订阅同步缓存".to_string());
+                return self.save_config_async();
+            }
+            Message::BtSave => {
+                self.config.bt.listen_port = self
+                    .bt_listen_port_input
+                    .trim()
+                    .parse::<u16>()
+                    .unwrap_or(0);
+                self.config.bt.max_peers_per_torrent = self
+                    .bt_max_peers_input
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(128)
+                    .clamp(10, 500);
+                self.config.bt.peer_connect_timeout_secs = self
+                    .bt_timeout_input
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(10)
+                    .clamp(3, 60);
+                self.bt_listen_port_input = self.config.bt.listen_port.to_string();
+                self.bt_max_peers_input = self.config.bt.max_peers_per_torrent.to_string();
+                self.bt_timeout_input = self.config.bt.peer_connect_timeout_secs.to_string();
+                self.toast = Some("BitTorrent 与自定义 Tracker 设置已保存".to_string());
+                return self.save_config_async();
+            }
+
+            // eD2k dedicated workspace
+            Message::Ed2kToggleEnabled(v) => {
+                self.config.ed2k.enabled = v;
+                return self.save_config_async();
+            }
+            Message::Ed2kNicknameChanged(v) => {
+                self.config.ed2k.nickname = v;
+            }
+            Message::Ed2kTcpPortChanged(v) => {
+                self.ed2k_tcp_port_input = v;
+            }
+            Message::Ed2kUdpPortChanged(v) => {
+                self.ed2k_udp_port_input = v;
+            }
+            Message::Ed2kToggleKad(v) => {
+                self.config.ed2k.enable_kad = v;
+                return self.save_config_async();
+            }
+            Message::Ed2kToggleObfuscation(v) => {
+                self.config.ed2k.enable_obfuscation = v;
+                return self.save_config_async();
+            }
+            Message::Ed2kMaxSourcesChanged(v) => {
+                self.ed2k_max_sources_input = v;
+            }
+            Message::Ed2kUploadLimitChanged(v) => {
+                self.ed2k_upload_limit_input = v;
+            }
+            Message::Ed2kToggleVerifyMd4(v) => {
+                self.config.ed2k.verify_md4_hash = v;
+                return self.save_config_async();
+            }
+            Message::Ed2kServerMetUrlChanged(v) => {
+                self.config.ed2k.server_met_url = v;
+            }
+            Message::Ed2kSyncServerMet => {
+                if self.ed2k_syncing_met {
+                    return Task::none();
+                }
+                self.ed2k_syncing_met = true;
+                self.ed2k_met_sync_status = Some("正在拉取并解析 server.met 服务器列表...".to_string());
+                let url = self.config.ed2k.server_met_url.clone();
+                let proxy = self.config.proxy_url.clone();
+                return Task::perform(
+                    async move { sync_servers_from_met(&url, proxy.as_deref()).await },
+                    Message::Ed2kSyncServerMetFinished,
+                );
+            }
+            Message::Ed2kSyncServerMetFinished(res) => {
+                self.ed2k_syncing_met = false;
+                match res {
+                    Ok(list) => {
+                        let mut added = 0usize;
+                        for entry in list {
+                            if !self
+                                .config
+                                .ed2k
+                                .servers
+                                .iter()
+                                .any(|s| s.host == entry.host && s.port == entry.port)
+                            {
+                                self.config.ed2k.servers.push(entry);
+                                added += 1;
+                            }
+                        }
+                        let msg = format!(
+                            "server.met 同步成功：新增 {added} 台服务器，当前共 {} 台",
+                            self.config.ed2k.servers.len()
+                        );
+                        self.ed2k_met_sync_status = Some(msg.clone());
+                        self.toast = Some(msg);
+                        return self.save_config_async();
+                    }
+                    Err(e) => {
+                        self.ed2k_met_sync_status = Some(format!("同步 server.met 失败：{e}"));
+                        self.toast = Some(format!("同步 server.met 失败：{e}"));
+                    }
+                }
+            }
+            Message::Ed2kQuickServerLinkChanged(v) => {
+                self.ed2k_quick_server_link = v;
+            }
+            Message::Ed2kImportQuickServerLink => {
+                if let Some(entry) = parse_ed2k_server_link(&self.ed2k_quick_server_link) {
+                    if !self
+                        .config
+                        .ed2k
+                        .servers
+                        .iter()
+                        .any(|s| s.host == entry.host && s.port == entry.port)
+                    {
+                        self.config.ed2k.servers.push(entry.clone());
+                        self.toast = Some(format!("已导入 eD2k 服务器 {}:{}", entry.host, entry.port));
+                    } else {
+                        self.toast = Some("该 eD2k 服务器已在列表中".to_string());
+                    }
+                    self.ed2k_quick_server_link.clear();
+                    return self.save_config_async();
+                } else {
+                    self.toast = Some(
+                        "格式无效，请输入 ed2k://|server|IP|PORT|/ 或 IP:PORT".to_string(),
+                    );
+                }
+            }
+            Message::Ed2kNewServerNameChanged(v) => {
+                self.ed2k_new_srv_name = v;
+            }
+            Message::Ed2kNewServerHostChanged(v) => {
+                self.ed2k_new_srv_host = v;
+            }
+            Message::Ed2kNewServerPortChanged(v) => {
+                self.ed2k_new_srv_port = v;
+            }
+            Message::Ed2kAddServer => {
+                let host = self.ed2k_new_srv_host.trim().to_string();
+                let Ok(port) = self.ed2k_new_srv_port.trim().parse::<u16>() else {
+                    self.toast = Some("请输入有效的端口号（1–65535）".to_string());
+                    return Task::none();
+                };
+                if host.is_empty() || port == 0 {
+                    self.toast = Some("请输入有效的服务器主机与端口".to_string());
+                    return Task::none();
+                }
+                let name = if self.ed2k_new_srv_name.trim().is_empty() {
+                    format!("eD2k {host}:{port}")
+                } else {
+                    self.ed2k_new_srv_name.trim().to_string()
+                };
+                if !self
+                    .config
+                    .ed2k
+                    .servers
+                    .iter()
+                    .any(|s| s.host == host && s.port == port)
+                {
+                    self.config.ed2k.servers.push(Ed2kServerEntry {
+                        name,
+                        host: host.clone(),
+                        port,
+                        enabled: true,
+                    });
+                    self.toast = Some(format!("已添加 eD2k 服务器 {host}:{port}"));
+                } else {
+                    self.toast = Some("该 eD2k 服务器已存在".to_string());
+                }
+                self.ed2k_new_srv_name.clear();
+                self.ed2k_new_srv_host.clear();
+                return self.save_config_async();
+            }
+            Message::Ed2kToggleServerEnabled(idx) => {
+                if let Some(srv) = self.config.ed2k.servers.get_mut(idx) {
+                    srv.enabled = !srv.enabled;
+                    return self.save_config_async();
+                }
+            }
+            Message::Ed2kRemoveServer(idx) => {
+                if idx < self.config.ed2k.servers.len() {
+                    self.config.ed2k.servers.remove(idx);
+                    return self.save_config_async();
+                }
+            }
+            Message::Ed2kResetDefaultServers => {
+                self.config.ed2k.servers = default_ed2k_servers();
+                self.ed2k_server_tests.clear();
+                self.toast = Some("已恢复默认 eD2k 服务器列表".to_string());
+                return self.save_config_async();
+            }
+            Message::Ed2kTestServer(idx) => {
+                if let Some(srv) = self.config.ed2k.servers.get(idx).cloned() {
+                    let key = format!("{}:{}", srv.host, srv.port);
+                    self.ed2k_server_tests
+                        .insert(key.clone(), ServerTestStatus::Testing);
+                    let nick = self.config.ed2k.nickname.clone();
+                    let tcp_port = self.config.ed2k.tcp_port;
+                    return Task::perform(
+                        async move {
+                            let res = test_ed2k_server(&srv.host, srv.port, &nick, tcp_port).await;
+                            (key, res)
+                        },
+                        |(k, r)| Message::Ed2kTestServerFinished(k, r),
+                    );
+                }
+            }
+            Message::Ed2kTestServerFinished(key, res) => {
+                match res {
+                    Ok(ms) => {
+                        self.ed2k_server_tests
+                            .insert(key, ServerTestStatus::Online(ms));
+                    }
+                    Err(e) => {
+                        self.ed2k_server_tests
+                            .insert(key, ServerTestStatus::Offline(e));
+                    }
+                }
+            }
+            Message::Ed2kSave => {
+                if self.config.ed2k.nickname.trim().is_empty() {
+                    self.config.ed2k.nickname = "Siphon".to_string();
+                }
+                self.config.ed2k.tcp_port = self
+                    .ed2k_tcp_port_input
+                    .trim()
+                    .parse::<u16>()
+                    .unwrap_or(4662)
+                    .max(1);
+                self.config.ed2k.udp_port = self
+                    .ed2k_udp_port_input
+                    .trim()
+                    .parse::<u16>()
+                    .unwrap_or(4672)
+                    .max(1);
+                self.config.ed2k.max_sources_per_file = self
+                    .ed2k_max_sources_input
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(400)
+                    .clamp(20, 5000);
+                self.config.ed2k.upload_limit_kbps = self
+                    .ed2k_upload_limit_input
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                self.ed2k_tcp_port_input = self.config.ed2k.tcp_port.to_string();
+                self.ed2k_udp_port_input = self.config.ed2k.udp_port.to_string();
+                self.ed2k_max_sources_input = self.config.ed2k.max_sources_per_file.to_string();
+                self.ed2k_upload_limit_input = self.config.ed2k.upload_limit_kbps.to_string();
+                self.toast = Some("eD2k 电驴协议设置已保存".to_string());
+                return self.save_config_async();
             }
 
             // Rules workspace
@@ -2897,6 +3376,21 @@ impl SiphonApp {
             InputTarget::SchedSpeedEnd => &self.config.schedule.speed_end_time,
             InputTarget::SchedSpeedKbps => &self.sched_speed_kbps_input,
             InputTarget::SchedScript => &self.config.schedule.post_queue_script,
+            InputTarget::BtListenPort => &self.bt_listen_port_input,
+            InputTarget::BtMaxPeers => &self.bt_max_peers_input,
+            InputTarget::BtConnectTimeout => &self.bt_timeout_input,
+            InputTarget::BtNewTracker => &self.bt_new_tracker_input,
+            InputTarget::BtNewSubscribeUrl => &self.bt_new_sub_url_input,
+            InputTarget::Ed2kNickname => &self.config.ed2k.nickname,
+            InputTarget::Ed2kTcpPort => &self.ed2k_tcp_port_input,
+            InputTarget::Ed2kUdpPort => &self.ed2k_udp_port_input,
+            InputTarget::Ed2kMaxSources => &self.ed2k_max_sources_input,
+            InputTarget::Ed2kUploadLimit => &self.ed2k_upload_limit_input,
+            InputTarget::Ed2kServerMetUrl => &self.config.ed2k.server_met_url,
+            InputTarget::Ed2kQuickServerLink => &self.ed2k_quick_server_link,
+            InputTarget::Ed2kNewServerName => &self.ed2k_new_srv_name,
+            InputTarget::Ed2kNewServerHost => &self.ed2k_new_srv_host,
+            InputTarget::Ed2kNewServerPort => &self.ed2k_new_srv_port,
             InputTarget::CaptureFilename => self
                 .capture_popup
                 .as_ref()
@@ -2946,6 +3440,21 @@ impl SiphonApp {
                 self.sched_speed_kbps_input = val;
             }
             InputTarget::SchedScript => self.config.schedule.post_queue_script = val,
+            InputTarget::BtListenPort => self.bt_listen_port_input = val,
+            InputTarget::BtMaxPeers => self.bt_max_peers_input = val,
+            InputTarget::BtConnectTimeout => self.bt_timeout_input = val,
+            InputTarget::BtNewTracker => self.bt_new_tracker_input = val,
+            InputTarget::BtNewSubscribeUrl => self.bt_new_sub_url_input = val,
+            InputTarget::Ed2kNickname => self.config.ed2k.nickname = val,
+            InputTarget::Ed2kTcpPort => self.ed2k_tcp_port_input = val,
+            InputTarget::Ed2kUdpPort => self.ed2k_udp_port_input = val,
+            InputTarget::Ed2kMaxSources => self.ed2k_max_sources_input = val,
+            InputTarget::Ed2kUploadLimit => self.ed2k_upload_limit_input = val,
+            InputTarget::Ed2kServerMetUrl => self.config.ed2k.server_met_url = val,
+            InputTarget::Ed2kQuickServerLink => self.ed2k_quick_server_link = val,
+            InputTarget::Ed2kNewServerName => self.ed2k_new_srv_name = val,
+            InputTarget::Ed2kNewServerHost => self.ed2k_new_srv_host = val,
+            InputTarget::Ed2kNewServerPort => self.ed2k_new_srv_port = val,
             InputTarget::CaptureFilename => {
                 if let Some(popup) = &mut self.capture_popup {
                     popup.filename = val;
@@ -2983,8 +3492,10 @@ impl SiphonApp {
             InputTarget::QuickBar | InputTarget::ModalUrl | InputTarget::ReplaceUrl
         );
         let low = cleaned.to_ascii_lowercase();
-        let pasted_is_url =
-            low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?");
+        let pasted_is_url = low.starts_with("http://")
+            || low.starts_with("https://")
+            || low.starts_with("magnet:?")
+            || low.starts_with("ed2k://|file|");
 
         let current = self.get_input_value(target).to_string();
         let next_val = if current.is_empty() || (is_url_box && pasted_is_url) {
@@ -3286,6 +3797,32 @@ impl SiphonApp {
         );
 
         let center_and_inspector: Element<'_, Message> = match self.active_nav {
+            NavSection::BitTorrent => views::bt_view::view(
+                &self.config.bt,
+                &self.bt_listen_port_input,
+                &self.bt_max_peers_input,
+                &self.bt_timeout_input,
+                &self.bt_new_tracker_input,
+                &self.bt_new_sub_url_input,
+                self.bt_syncing_trackers,
+                self.bt_sync_status.as_deref(),
+                palette,
+            ),
+            NavSection::Ed2k => views::ed2k_view::view(
+                &self.config.ed2k,
+                &self.ed2k_tcp_port_input,
+                &self.ed2k_udp_port_input,
+                &self.ed2k_max_sources_input,
+                &self.ed2k_upload_limit_input,
+                &self.ed2k_quick_server_link,
+                &self.ed2k_new_srv_name,
+                &self.ed2k_new_srv_host,
+                &self.ed2k_new_srv_port,
+                self.ed2k_syncing_met,
+                self.ed2k_met_sync_status.as_deref(),
+                &self.ed2k_server_tests,
+                palette,
+            ),
             NavSection::Scheduler => views::scheduler_view::view(
                 &self.config.schedule,
                 &self.sched_speed_kbps_input,
@@ -3327,7 +3864,8 @@ impl SiphonApp {
                 let filter_text = !query.is_empty()
                     && !query.starts_with("http://")
                     && !query.starts_with("https://")
-                    && !query.starts_with("magnet:?");
+                    && !query.starts_with("magnet:?")
+                    && !query.starts_with("ed2k://");
 
                 let filtered: Vec<&DownloadTask> = self
                     .tasks
@@ -3451,7 +3989,7 @@ impl SiphonApp {
                         .size(16)
                         .font(FONT_MEDIUM)
                         .color(palette.text_primary),
-                    text("支持浏览器超链接、地址栏 URL、HLS .m3u8、Magnet 磁力、.torrent 种子与 .url 快捷方式")
+                    text("支持浏览器超链接、地址栏 URL、HLS .m3u8、Magnet 磁力、.torrent 种子、eD2k 电驴与 .url 快捷方式")
                         .size(13)
                         .font(FONT_REGULAR)
                         .color(palette.text_secondary),
@@ -3602,7 +4140,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Extract an HTTP/HTTPS/Magnet URL from a dragged `.url` Windows shortcut or text file.
+/// Extract an HTTP/HTTPS/Magnet/eD2k URL from a dragged `.url` Windows shortcut or text file.
 fn extract_url_from_dropped_file(path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     for line in raw.lines() {
@@ -3610,13 +4148,20 @@ fn extract_url_from_dropped_file(path: &std::path::Path) -> Option<String> {
         if let Some(rest) = trimmed.strip_prefix("URL=").or_else(|| trimmed.strip_prefix("url=")) {
             let candidate = rest.trim();
             let low = candidate.to_ascii_lowercase();
-            if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?")
+            if low.starts_with("http://")
+                || low.starts_with("https://")
+                || low.starts_with("magnet:?")
+                || low.starts_with("ed2k://|file|")
             {
                 return Some(candidate.to_string());
             }
         }
         let low = trimmed.to_ascii_lowercase();
-        if low.starts_with("http://") || low.starts_with("https://") || low.starts_with("magnet:?") {
+        if low.starts_with("http://")
+            || low.starts_with("https://")
+            || low.starts_with("magnet:?")
+            || low.starts_with("ed2k://|file|")
+        {
             return Some(trimmed.to_string());
         }
     }

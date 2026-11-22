@@ -110,6 +110,197 @@ pub fn is_time_in_window(now_mins: u16, start_hhmm: &str, end_hhmm: &str) -> boo
     }
 }
 
+/// Default curated public BitTorrent tracker subscription lists.
+pub fn default_tracker_subscribe_urls() -> Vec<String> {
+    vec![
+        "https://cf.trackerslist.com/best.txt".to_string(),
+        "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
+            .to_string(),
+    ]
+}
+
+/// Parse, validate, and deduplicate BitTorrent tracker URLs from multi-line / comma / whitespace text.
+pub fn parse_tracker_list(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        for tok in line.split([',', ';', ' ', '\t']) {
+            let candidate = tok.trim().trim_matches(|c| matches!(c, '"' | '\''));
+            if candidate.is_empty() {
+                continue;
+            }
+            let low = candidate.to_ascii_lowercase();
+            let valid_scheme = low.starts_with("udp://")
+                || low.starts_with("http://")
+                || low.starts_with("https://")
+                || low.starts_with("ws://")
+                || low.starts_with("wss://");
+            if valid_scheme && url::Url::parse(candidate).is_ok() && seen.insert(candidate.to_string()) {
+                out.push(candidate.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtConfig {
+    /// Enable BitTorrent DHT network for trackerless peer discovery.
+    pub enable_dht: bool,
+    /// Enable Local Service Discovery (LSD) on LAN.
+    pub enable_lsd: bool,
+    /// Enable UPnP automatic port forwarding on the router.
+    pub enable_upnp: bool,
+    /// Disable tracker announcements completely (DHT-only mode).
+    pub disable_trackers: bool,
+    /// Incoming TCP/uTP listen port (`0` = automatic random port).
+    pub listen_port: u16,
+    /// Peer TCP connection timeout in seconds.
+    pub peer_connect_timeout_secs: u64,
+    /// Maximum concurrent peers per torrent task.
+    pub max_peers_per_torrent: usize,
+    /// Automatically append custom & subscribed trackers to every magnet / `.torrent` task.
+    pub auto_append_trackers: bool,
+    /// User-defined custom tracker URLs (`udp://`, `http://`, `https://`, `ws://`, `wss://`).
+    pub custom_trackers: Vec<String>,
+    /// Online tracker list subscription URLs for one-click sync.
+    pub tracker_subscribe_urls: Vec<String>,
+    /// Trackers fetched from `tracker_subscribe_urls`.
+    pub synced_trackers: Vec<String>,
+    /// Human-readable timestamp of the last successful tracker sync.
+    pub last_tracker_sync_at: Option<String>,
+    /// Automatically refresh subscribed trackers when Siphon starts.
+    pub auto_sync_trackers_on_start: bool,
+}
+
+impl Default for BtConfig {
+    fn default() -> Self {
+        Self {
+            enable_dht: true,
+            enable_lsd: true,
+            enable_upnp: true,
+            disable_trackers: false,
+            listen_port: 0,
+            peer_connect_timeout_secs: 10,
+            max_peers_per_torrent: 128,
+            auto_append_trackers: true,
+            custom_trackers: vec![
+                "udp://tracker.opentrackr.org:1337/announce".to_string(),
+                "udp://open.stealth.si:80/announce".to_string(),
+                "udp://tracker.torrent.eu.org:451/announce".to_string(),
+                "https://tracker.tamersunion.org:443/announce".to_string(),
+            ],
+            tracker_subscribe_urls: default_tracker_subscribe_urls(),
+            synced_trackers: Vec::new(),
+            last_tracker_sync_at: None,
+            auto_sync_trackers_on_start: false,
+        }
+    }
+}
+
+impl BtConfig {
+    /// Merge `custom_trackers` and `synced_trackers`, preserving priority and deduplicating valid URLs.
+    pub fn effective_trackers(&self) -> Vec<String> {
+        let mut combined = String::new();
+        for t in &self.custom_trackers {
+            combined.push_str(t);
+            combined.push('\n');
+        }
+        for t in &self.synced_trackers {
+            combined.push_str(t);
+            combined.push('\n');
+        }
+        parse_tracker_list(&combined)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ed2kServerEntry {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Curated public eD2k servers for initial configuration.
+pub fn default_ed2k_servers() -> Vec<Ed2kServerEntry> {
+    vec![
+        Ed2kServerEntry {
+            name: "eMule Security".to_string(),
+            host: "45.82.80.155".to_string(),
+            port: 5687,
+            enabled: true,
+        },
+        Ed2kServerEntry {
+            name: "eDonkey Server No2".to_string(),
+            host: "5.45.85.226".to_string(),
+            port: 6584,
+            enabled: true,
+        },
+        Ed2kServerEntry {
+            name: "GrupoTS Server".to_string(),
+            host: "145.239.2.134".to_string(),
+            port: 4661,
+            enabled: true,
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ed2kConfig {
+    /// Enable the eD2k protocol handler and link capture.
+    pub enabled: bool,
+    /// Client nickname announced to eD2k servers and peers.
+    pub nickname: String,
+    /// eD2k TCP listen port (classic default `4662`).
+    pub tcp_port: u16,
+    /// eD2k Kad UDP port (classic default `4672`).
+    pub udp_port: u16,
+    /// Enable Kademlia (Kad) serverless peer network.
+    pub enable_kad: bool,
+    /// Enable eD2k protocol obfuscation to avoid ISP throttling.
+    pub enable_obfuscation: bool,
+    /// Maximum number of sources tracked per eD2k file.
+    pub max_sources_per_file: u32,
+    /// Upload speed limit in KB/s (`0` = unlimited).
+    pub upload_limit_kbps: u64,
+    /// Verify final downloaded file against the eD2k MD4 root hash.
+    pub verify_md4_hash: bool,
+    /// Remote `server.met` subscription URL for one-click server list update.
+    pub server_met_url: String,
+    /// Configured eD2k servers (`host:port`).
+    pub servers: Vec<Ed2kServerEntry>,
+}
+
+impl Default for Ed2kConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            nickname: "Siphon".to_string(),
+            tcp_port: 4662,
+            udp_port: 4672,
+            enable_kad: true,
+            enable_obfuscation: true,
+            max_sources_per_file: 400,
+            upload_limit_kbps: 0,
+            verify_md4_hash: true,
+            server_met_url: "http://upd.emule-security.org/server.met".to_string(),
+            servers: default_ed2k_servers(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -145,6 +336,8 @@ pub struct AppConfig {
     pub proxy_url: Option<String>,
     pub user_agent: String,
     pub schedule: ScheduleConfig,
+    pub bt: BtConfig,
+    pub ed2k: Ed2kConfig,
 }
 
 impl Default for AppConfig {
@@ -177,6 +370,8 @@ impl Default for AppConfig {
             proxy_url: None,
             user_agent: format!("Siphon/{} (Windows NT 10.0; Win64; x64)", env!("CARGO_PKG_VERSION")),
             schedule: ScheduleConfig::default(),
+            bt: BtConfig::default(),
+            ed2k: Ed2kConfig::default(),
         }
     }
 }
@@ -336,4 +531,68 @@ fn copy_dir_simple(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracker_parser_filters_invalid_and_deduplicates() {
+        let raw = r#"
+            # Comment line
+            udp://tracker.opentrackr.org:1337/announce
+            http://example.com:6969/announce, https://tracker.example.org/announce
+            udp://tracker.opentrackr.org:1337/announce
+            ftp://not-a-bt-tracker.com/announce
+            not a url at all
+            wss://tracker.openwebtorrent.com
+        "#;
+        let parsed = parse_tracker_list(raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "udp://tracker.opentrackr.org:1337/announce",
+                "http://example.com:6969/announce",
+                "https://tracker.example.org/announce",
+                "wss://tracker.openwebtorrent.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn bt_and_ed2k_configs_roundtrip_via_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.bt.listen_port = 51413;
+        cfg.bt.custom_trackers = vec!["udp://custom.tracker:80/announce".into()];
+        cfg.bt.synced_trackers = vec![
+            "udp://custom.tracker:80/announce".into(),
+            "https://synced.tracker/announce".into(),
+        ];
+        cfg.ed2k.nickname = "SiphonTest".into();
+        cfg.ed2k.tcp_port = 14662;
+        cfg.ed2k.udp_port = 14672;
+        cfg.ed2k.servers.push(Ed2kServerEntry {
+            name: "Custom Node".into(),
+            host: "127.0.0.1".into(),
+            port: 4661,
+            enabled: true,
+        });
+
+        cfg.save(tmp.path()).unwrap();
+        let loaded = AppConfig::load_or_default(tmp.path()).unwrap();
+        assert_eq!(loaded.bt.listen_port, 51413);
+        assert_eq!(
+            loaded.bt.effective_trackers(),
+            vec![
+                "udp://custom.tracker:80/announce",
+                "https://synced.tracker/announce",
+            ]
+        );
+        assert_eq!(loaded.ed2k.nickname, "SiphonTest");
+        assert_eq!(loaded.ed2k.tcp_port, 14662);
+        assert_eq!(loaded.ed2k.udp_port, 14672);
+        assert!(loaded.ed2k.servers.iter().any(|s| s.name == "Custom Node"));
+    }
 }

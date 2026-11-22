@@ -177,6 +177,15 @@ pub fn view<'a>(
         space::vertical().height(14),
         cat_col,
         space::vertical().height(14),
+        section_label(strings.nav_protocols()),
+        nav_item(
+            NavSection::BitTorrent,
+            strings.bt_tracker(),
+            IconKind::Magnet,
+            None,
+        ),
+        nav_item(NavSection::Ed2k, strings.ed2k(), IconKind::Server, None),
+        space::vertical().height(14),
         section_label(strings.nav_workspace()),
         nav_item(
             NavSection::Scheduler,

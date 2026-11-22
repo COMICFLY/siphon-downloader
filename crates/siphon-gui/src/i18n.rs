@@ -30,8 +30,17 @@ impl Strings {
     pub fn nav_categories(&self) -> &'static str {
         self.t("分类", "Categories")
     }
+    pub fn nav_protocols(&self) -> &'static str {
+        self.t("协议", "Protocols")
+    }
     pub fn nav_workspace(&self) -> &'static str {
         self.t("工具", "Tools")
+    }
+    pub fn bt_tracker(&self) -> &'static str {
+        self.t("BT / Tracker", "BT / Tracker")
+    }
+    pub fn ed2k(&self) -> &'static str {
+        self.t("eD2k 电驴", "eD2k")
     }
     pub fn all_tasks(&self) -> &'static str {
         self.t("全部任务", "All downloads")

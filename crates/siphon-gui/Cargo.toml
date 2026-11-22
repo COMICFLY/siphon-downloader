@@ -13,6 +13,7 @@ siphon-core.workspace = true
 siphon-engine-http.workspace = true
 siphon-engine-hls.workspace = true
 siphon-engine-bt.workspace = true
+siphon-engine-ed2k.workspace = true
 siphon-platform-win.workspace = true
 iced.workspace = true
 tokio.workspace = true
