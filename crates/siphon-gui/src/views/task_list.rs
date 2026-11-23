@@ -434,8 +434,14 @@ fn task_row<'a>(
         task.protocol,
         ProtocolKind::Hls | ProtocolKind::BitTorrent | ProtocolKind::Ed2k
     ) {
+        let is_magnet = task
+            .original_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("magnet:?");
         let (badge_txt, badge_fg, badge_bg) = match task.protocol {
             ProtocolKind::Hls => ("HLS", palette.ok, palette.ok_soft),
+            ProtocolKind::BitTorrent if is_magnet => ("MAGNET", palette.accent, palette.accent_soft),
             ProtocolKind::BitTorrent => ("BT", palette.warn, palette.warn_soft),
             ProtocolKind::Ed2k => ("eD2k", palette.accent, palette.accent_soft),
             _ => unreachable!(),
@@ -492,8 +498,15 @@ fn task_row<'a>(
             );
     }
 
-    let domain = task.domain();
-    if !domain.is_empty() {
+    if task.protocol == ProtocolKind::BitTorrent
+        && let Some(tel) = &task.bt_telemetry
+        && task.status.is_active()
+    {
+        let peer_info = if tel.live_ipv6 > 0 {
+            format!("Peer {}/{} (v6:{})", tel.live_peers, tel.seen_peers, tel.live_ipv6)
+        } else {
+            format!("Peer {}/{}", tel.live_peers, tel.seen_peers)
+        };
         meta_row = meta_row
             .push(
                 text("·")
@@ -503,15 +516,41 @@ fn task_row<'a>(
             )
             .push(
                 container(
-                    text(domain)
+                    text(peer_info)
                         .size(12)
-                        .font(FONT_REGULAR)
+                        .font(FONT_MONO)
                         .wrapping(text::Wrapping::None)
-                        .color(palette.text_muted),
+                        .color(if tel.live_peers > 0 {
+                            palette.accent
+                        } else {
+                            palette.warn
+                        }),
                 )
                 .width(Length::Fill)
                 .clip(true),
             );
+    } else {
+        let domain = task.domain();
+        if !domain.is_empty() {
+            meta_row = meta_row
+                .push(
+                    text("·")
+                        .size(12)
+                        .wrapping(text::Wrapping::None)
+                        .color(palette.text_muted),
+                )
+                .push(
+                    container(
+                        text(domain)
+                            .size(12)
+                            .font(FONT_REGULAR)
+                            .wrapping(text::Wrapping::None)
+                            .color(palette.text_muted),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                );
+        }
     }
 
     let metrics = if task.status == TaskStatus::Downloading {

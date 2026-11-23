@@ -1,7 +1,9 @@
 use crate::config::{BtConfig, Ed2kConfig};
 use crate::error::Result;
 use crate::limiter::HierarchicalLimiter;
-use crate::model::{DownloadTask, ProbeMetadata, ProtocolKind, SegmentInfo, TaskLogEntry};
+use crate::model::{
+    BtLiveTelemetry, DownloadTask, ProbeMetadata, ProtocolKind, SegmentInfo, TaskLogEntry,
+};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,6 +21,7 @@ pub enum EngineUpdate {
         eta_secs: Option<u64>,
         segments: Vec<SegmentInfo>,
     },
+    BtTelemetry(BtLiveTelemetry),
     Verifying,
     Log(TaskLogEntry),
 }

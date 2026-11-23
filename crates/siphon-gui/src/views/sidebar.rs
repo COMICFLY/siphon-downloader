@@ -3,17 +3,22 @@ use crate::icons::{IconKind, icon};
 use crate::state::{Message, NavSection};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_MONO_BOLD, FONT_REGULAR, SiphonPalette, clean_scrollable_style,
-    hairline_rule_style, nav_btn_style, panel_style,
+    hairline_rule_style, nav_btn_style, outline_btn_style, panel_style, subtle_btn_style,
 };
 use iced::widget::{button, column, container, row, rule, scrollable, space, text};
 use iced::{Alignment, Color, Element, Length};
 use siphon_core::{DownloadTask, FileCategory, TaskStatus, format_speed};
+use siphon_engine_bt::{BtPortCheckReport, BtPortLight, BtSessionStatusSnapshot};
 
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     active_nav: NavSection,
     tasks: &'a [DownloadTask],
     global_speed_bps: u64,
     active_count: usize,
+    bt_status: &'a BtSessionStatusSnapshot,
+    bt_port_report: Option<&'a BtPortCheckReport>,
+    bt_checking_port: bool,
     palette: SiphonPalette,
     strings: Strings,
 ) -> Element<'a, Message> {
@@ -216,6 +221,116 @@ pub fn view<'a>(
         left: 12.0,
     });
 
+    // Compact live BT connection & port status card right above global throughput
+    let bt_light = match bt_port_report.map(|r| r.light) {
+        Some(BtPortLight::Red) => BtPortLight::Red,
+        Some(BtPortLight::Green) => BtPortLight::Green,
+        Some(BtPortLight::Yellow) if bt_status.incoming_observed => BtPortLight::Green,
+        Some(BtPortLight::Yellow) => BtPortLight::Yellow,
+        _ if bt_status.incoming_observed => BtPortLight::Green,
+        _ => BtPortLight::Unknown,
+    };
+
+    let (bt_dot_color, bt_status_label) = if bt_checking_port {
+        (palette.accent, "BT 端口检测中...")
+    } else {
+        match bt_light {
+            BtPortLight::Green => (palette.ok, "BT 绿灯 · 入站畅通"),
+            BtPortLight::Yellow => (palette.warn, "BT 黄灯 · 仅出站"),
+            BtPortLight::Red => (palette.err, "BT 红灯 · 监听异常"),
+            BtPortLight::Unknown => {
+                if bt_status.session_ready {
+                    (palette.accent, "BT 就绪 · 待测端口")
+                } else {
+                    (palette.text_muted, "BT 引擎预热中")
+                }
+            }
+        }
+    };
+
+    let dht_total = bt_status.dht_nodes_v4 + bt_status.dht_nodes_v6;
+    let port_text = if bt_status.listen_port > 0 {
+        format!(":{}", bt_status.listen_port)
+    } else if let Some(rep) = bt_port_report {
+        format!(":{}", rep.listen_port)
+    } else {
+        "--".to_string()
+    };
+    let bt_sub_line = if bt_status.live_peers > 0 {
+        format!(
+            "{} {} · Peer {} · DHT {}",
+            if bt_status.dual_stack { "双栈" } else { "v4" },
+            port_text,
+            bt_status.live_peers,
+            dht_total
+        )
+    } else if bt_status.session_ready {
+        format!(
+            "{} {} · DHT {}",
+            if bt_status.dual_stack { "双栈" } else { "v4" },
+            port_text,
+            dht_total
+        )
+    } else {
+        "点击进入 BT 网络诊断".to_string()
+    };
+
+    let bt_dot = container(space())
+        .width(Length::Fixed(7.0))
+        .height(Length::Fixed(7.0))
+        .style(panel_style(bt_dot_color, None, 4.0));
+
+    let mut check_btn = button(
+        text(if bt_checking_port { "检测中" } else { "测端口" })
+            .size(11)
+            .font(FONT_REGULAR)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding([3, 7])
+    .style(outline_btn_style(palette));
+    if !bt_checking_port {
+        check_btn = check_btn.on_press(Message::BtCheckPort);
+    }
+
+    let bt_card = container(
+        column![
+            row![
+                button(
+                    row![
+                        bt_dot,
+                        container(
+                            text(bt_status_label)
+                                .size(12)
+                                .font(FONT_MEDIUM)
+                                .wrapping(text::Wrapping::None)
+                                .color(palette.text_primary),
+                        )
+                        .width(Length::Fill)
+                        .clip(true),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([1, 2])
+                .width(Length::Fill)
+                .style(subtle_btn_style(palette, false))
+                .on_press(Message::SelectNav(NavSection::BitTorrent)),
+                check_btn,
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(bt_sub_line)
+                .size(11)
+                .font(FONT_MONO)
+                .wrapping(text::Wrapping::None)
+                .color(palette.text_muted),
+        ]
+        .spacing(5),
+    )
+    .width(Length::Fill)
+    .padding([9, 12])
+    .style(panel_style(palette.bg_card, Some(palette.hairline), 10.0));
+
     // Bottom live throughput telemetry readout (calm graphite card + live dot)
     let status_dot = container(space())
         .width(Length::Fixed(7.0))
@@ -267,7 +382,7 @@ pub fn view<'a>(
             .height(Length::Fill)
             .style(clean_scrollable_style(palette)),
         rule::horizontal(1).style(hairline_rule_style(palette)),
-        container(telemetry).padding(12),
+        container(column![bt_card, telemetry].spacing(8)).padding(12),
     ]
     .height(Length::Fill);
 

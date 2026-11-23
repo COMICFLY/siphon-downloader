@@ -11,9 +11,9 @@ pub mod storage;
 
 pub use batch::{BatchExpandResult, MAX_BATCH_URLS, expand_batch_input};
 pub use config::{
-    AppConfig, BtConfig, Ed2kConfig, Ed2kServerEntry, Language, ListDensity, QueueCompleteAction,
-    ScheduleConfig, ThemeMode, default_ed2k_servers, default_tracker_subscribe_urls,
-    is_time_in_window, parse_hhmm, parse_tracker_list,
+    AppConfig, BtConfig, BtEncryptionMode, Ed2kConfig, Ed2kServerEntry, Language, ListDensity,
+    QueueCompleteAction, ScheduleConfig, ThemeMode, default_ed2k_servers,
+    default_tracker_subscribe_urls, is_time_in_window, parse_hhmm, parse_tracker_list,
 };
 pub use error::{Result, SiphonError};
 pub use limiter::{HierarchicalLimiter, TokenBucket};
@@ -22,9 +22,10 @@ pub use manager::{
     sanitize_filename,
 };
 pub use model::{
-    ChecksumSpec, DownloadTask, FileCategory, HashAlgorithm, NewTaskRequest, ProbeMetadata,
-    ProbePreview, ProtocolKind, SegmentInfo, SegmentState, SpeedSample, TaskEvent, TaskId,
-    TaskLogEntry, TaskSource, TaskStatus, format_bytes, format_eta, format_speed,
+    BtLiveTelemetry, BtPeerBrief, ChecksumSpec, DownloadTask, FileCategory, HashAlgorithm,
+    NewTaskRequest, ProbeMetadata, ProbePreview, ProtocolKind, SegmentInfo, SegmentState,
+    SpeedSample, TaskEvent, TaskId, TaskLogEntry, TaskSource, TaskStatus, format_bytes, format_eta,
+    format_speed,
 };
 pub use plugin::{
     ExternalPlugin, ExtraTaskSpec, LinkResolver, PluginManifest, PluginRegistry, PostDownloadInput,

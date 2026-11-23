@@ -306,6 +306,45 @@ pub struct TaskLogEntry {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BtPeerBrief {
+    pub addr: String,
+    pub is_ipv6: bool,
+    pub transport: String,
+    pub incoming: bool,
+    pub client: String,
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+}
+
+/// Real-time BitTorrent / Magnet swarm telemetry attached to an active `DownloadTask`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BtLiveTelemetry {
+    pub info_hash: String,
+    pub phase: String,
+    pub listen_addr: String,
+    pub listen_port: u16,
+    pub dual_stack: bool,
+    pub live_peers: u32,
+    pub live_tcp: u32,
+    pub live_utp: u32,
+    pub live_seeders: u32,
+    pub live_ipv6: u32,
+    pub incoming_peers: u32,
+    pub connecting_peers: u32,
+    pub queued_peers: u32,
+    pub seen_peers: u32,
+    pub dead_peers: u32,
+    pub upload_speed_bps: u64,
+    pub uploaded_bytes: u64,
+    pub checked_pieces: u64,
+    pub total_pieces: u64,
+    pub tracker_count: usize,
+    pub dht_nodes_v4: usize,
+    pub dht_nodes_v6: usize,
+    pub top_peers: Vec<BtPeerBrief>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadTask {
     pub id: TaskId,
@@ -340,6 +379,9 @@ pub struct DownloadTask {
     pub segments: Vec<SegmentInfo>,
     pub speed_history: Vec<SpeedSample>,
     pub logs: Vec<TaskLogEntry>,
+    /// Transient real-time BitTorrent / Magnet peer & swarm telemetry (not persisted in SQLite).
+    #[serde(skip)]
+    pub bt_telemetry: Option<BtLiveTelemetry>,
 }
 
 impl DownloadTask {
@@ -477,6 +519,10 @@ pub enum TaskEvent {
         speed_bps: u64,
         eta_secs: Option<u64>,
         segments: Vec<SegmentInfo>,
+    },
+    BtTelemetry {
+        task_id: TaskId,
+        telemetry: BtLiveTelemetry,
     },
     TaskCompleted {
         task_id: TaskId,

@@ -14,6 +14,7 @@ percent-encoding.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+network-interface = "2"
 librqbit = { version = "9.1", default-features = false, features = ["default-tls"] }
 
 [dev-dependencies]

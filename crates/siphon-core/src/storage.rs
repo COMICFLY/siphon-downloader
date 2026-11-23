@@ -378,6 +378,7 @@ impl TaskStore {
                 segments: Vec::new(),
                 speed_history: Vec::new(),
                 logs: Vec::new(),
+                bt_telemetry: None,
             })
         })?;
 
@@ -547,6 +548,7 @@ mod tests {
             ],
             speed_history: vec![],
             logs: vec![],
+            bt_telemetry: None,
         };
 
         store.upsert_task(&task).unwrap();

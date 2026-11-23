@@ -4,19 +4,22 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::DhtPersistenceConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig,
-    ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionOptions,
+    EncryptionMode, ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionOptions,
 };
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use percent_encoding::percent_decode_str;
 use siphon_core::{
-    BtConfig, DownloadContext, DownloadOutcome, EngineUpdate, FileCategory, ProbeMetadata,
-    ProtocolHandler, ProtocolKind, Result, SegmentInfo, SegmentState, SiphonError, TaskLogEntry,
-    parse_tracker_list,
+    BtConfig, BtEncryptionMode, BtLiveTelemetry, BtPeerBrief, DownloadContext, DownloadOutcome,
+    EngineUpdate, FileCategory, ProbeMetadata, ProtocolHandler, ProtocolKind, Result, SegmentInfo,
+    SegmentState, SiphonError, TaskLogEntry, parse_tracker_list,
 };
 use std::collections::{BTreeMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -26,8 +29,11 @@ struct SessionFingerprint {
     enable_lsd: bool,
     enable_upnp: bool,
     disable_trackers: bool,
+    ipv4_only: bool,
+    encryption_mode: BtEncryptionMode,
     listen_port: u16,
     peer_connect_timeout_secs: u64,
+    peer_read_write_timeout_secs: u64,
     max_peers_per_torrent: usize,
     proxy_url: Option<String>,
 }
@@ -39,8 +45,11 @@ impl SessionFingerprint {
             enable_lsd: bt.enable_lsd,
             enable_upnp: bt.enable_upnp,
             disable_trackers: bt.disable_trackers,
+            ipv4_only: bt.ipv4_only,
+            encryption_mode: bt.encryption_mode,
             listen_port: bt.listen_port,
             peer_connect_timeout_secs: bt.peer_connect_timeout_secs,
+            peer_read_write_timeout_secs: bt.peer_read_write_timeout_secs,
             max_peers_per_torrent: bt.max_peers_per_torrent,
             proxy_url: proxy_url
                 .map(str::trim)
@@ -74,12 +83,80 @@ pub struct TorrentInspectInfo {
     pub files: Vec<TorrentFileEntry>,
 }
 
+/// Traffic-light verdict for BitTorrent incoming port & network reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BtPortLight {
+    #[default]
+    Unknown,
+    /// Local listener healthy and public inbound reachability verified (port open, IPv6 reachable, or inbound peers observed).
+    Green,
+    /// Local listener healthy for outbound peers, but inbound port appears firewalled / behind CGNAT.
+    Yellow,
+    /// Local listener failed to bind or did not respond to loopback probe.
+    Red,
+}
+
+/// Real-time snapshot of the shared BitTorrent session, DHT tables, and connection counters.
+#[derive(Debug, Clone, Default)]
+pub struct BtSessionStatusSnapshot {
+    pub session_ready: bool,
+    pub listen_addr: Option<String>,
+    pub listen_port: u16,
+    pub dual_stack: bool,
+    pub encryption_mode: BtEncryptionMode,
+    pub detected_tun_adapter: Option<String>,
+    pub upnp_enabled: bool,
+    pub dht_enabled: bool,
+    pub dht_nodes_v4: usize,
+    pub dht_nodes_v6: usize,
+    pub live_peers: u32,
+    pub live_tcp: u32,
+    pub live_utp: u32,
+    pub live_seeders: u32,
+    pub connecting_peers: u32,
+    pub seen_peers: u32,
+    pub incoming_observed: bool,
+    pub tcp_v4_ok: u64,
+    pub tcp_v6_ok: u64,
+    pub utp_v4_ok: u64,
+    pub utp_v6_ok: u64,
+    pub tcp_v4_err: u64,
+    pub tcp_v6_err: u64,
+    pub utp_v4_err: u64,
+    pub utp_v6_err: u64,
+    pub download_speed_bps: u64,
+    pub upload_speed_bps: u64,
+}
+
+/// Detailed diagnostic report produced by `BitTorrentEngine::check_port_status`.
+#[derive(Debug, Clone)]
+pub struct BtPortCheckReport {
+    pub light: BtPortLight,
+    pub checked_at: String,
+    pub listen_addr: String,
+    pub listen_port: u16,
+    pub dual_stack: bool,
+    pub encryption_mode: BtEncryptionMode,
+    pub detected_tun_adapter: Option<String>,
+    pub local_v4_ok: bool,
+    pub local_v6_ok: Option<bool>,
+    pub public_ipv4: Option<String>,
+    pub public_ipv6: Option<String>,
+    pub external_port_open: Option<bool>,
+    pub incoming_observed: bool,
+    pub dht_nodes_v4: usize,
+    pub dht_nodes_v6: usize,
+    pub summary: String,
+    pub advice: String,
+}
+
 /// Pure-Rust BitTorrent / Magnet download engine powered by `librqbit`,
 /// using a long-lived pre-warmed shared session with persisted DHT routing table,
 /// TCP+uTP listeners, and full custom tracker injection for instant task startup.
 pub struct BitTorrentEngine {
     data_dir: Option<PathBuf>,
     warm: Mutex<Option<WarmSession>>,
+    incoming_observed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for BitTorrentEngine {
@@ -101,6 +178,7 @@ impl BitTorrentEngine {
         Self {
             data_dir: None,
             warm: Mutex::new(None),
+            incoming_observed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -109,6 +187,204 @@ impl BitTorrentEngine {
         Self {
             data_dir: Some(data_dir),
             warm: Mutex::new(None),
+            incoming_observed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Non-blocking snapshot of the currently warm BitTorrent session for live UI telemetry.
+    pub async fn live_session_status(&self, bt: &BtConfig) -> BtSessionStatusSnapshot {
+        let incoming_observed = self.incoming_observed.load(Ordering::Relaxed);
+        let detected_tun_adapter = detect_tun_adapter();
+        let guard = self.warm.lock().await;
+        let Some(warm) = guard.as_ref() else {
+            return BtSessionStatusSnapshot {
+                session_ready: false,
+                listen_addr: None,
+                listen_port: bt.listen_port,
+                dual_stack: !bt.ipv4_only,
+                encryption_mode: bt.encryption_mode,
+                detected_tun_adapter,
+                upnp_enabled: bt.enable_upnp,
+                dht_enabled: bt.enable_dht,
+                incoming_observed,
+                ..Default::default()
+            };
+        };
+
+        let sess = &warm.session;
+        let snap = sess.stats_snapshot();
+        let listen_addr = sess.listen_addr();
+        let listen_port = sess
+            .announce_port()
+            .or_else(|| listen_addr.map(|a| a.port()))
+            .unwrap_or(bt.listen_port);
+        let dual_stack = listen_addr.map(|a| a.is_ipv6()).unwrap_or(!bt.ipv4_only);
+        let (dht_nodes_v4, dht_nodes_v6) = sess
+            .get_dht()
+            .map(|d| {
+                let ds = d.stats();
+                (ds.routing_table_size, ds.routing_table_size_v6)
+            })
+            .unwrap_or((0, 0));
+
+        BtSessionStatusSnapshot {
+            session_ready: true,
+            listen_addr: listen_addr.map(|a| a.to_string()),
+            listen_port,
+            dual_stack,
+            encryption_mode: bt.encryption_mode,
+            detected_tun_adapter,
+            upnp_enabled: bt.enable_upnp,
+            dht_enabled: bt.enable_dht,
+            dht_nodes_v4,
+            dht_nodes_v6,
+            live_peers: snap.peers.live,
+            live_tcp: snap.peers.live_tcp,
+            live_utp: snap.peers.live_utp,
+            live_seeders: snap.peers.live_seeders,
+            connecting_peers: snap.peers.connecting,
+            seen_peers: snap.peers.seen,
+            incoming_observed,
+            tcp_v4_ok: snap.connections.tcp.v4.successes,
+            tcp_v6_ok: snap.connections.tcp.v6.successes,
+            utp_v4_ok: snap.connections.utp.v4.successes,
+            utp_v6_ok: snap.connections.utp.v6.successes,
+            tcp_v4_err: snap.connections.tcp.v4.errors,
+            tcp_v6_err: snap.connections.tcp.v6.errors,
+            utp_v4_err: snap.connections.utp.v4.errors,
+            utp_v6_err: snap.connections.utp.v6.errors,
+            download_speed_bps: (snap.download_speed.mbps * 1024.0 * 1024.0).max(0.0) as u64,
+            upload_speed_bps: (snap.upload_speed.mbps * 1024.0 * 1024.0).max(0.0) as u64,
+        }
+    }
+
+    /// Run a real-time local loopback + public IPv4/IPv6 + external TCP port reachability check.
+    pub async fn check_port_status(
+        &self,
+        bt: &BtConfig,
+        fallback_dir: &Path,
+        proxy_url: Option<&str>,
+    ) -> BtPortCheckReport {
+        let checked_at = chrono::Local::now().format("%H:%M:%S").to_string();
+        let incoming_observed = self.incoming_observed.load(Ordering::Relaxed);
+        let detected_tun_adapter = detect_tun_adapter();
+
+        let session = match self
+            .get_or_create_session(bt, fallback_dir, proxy_url)
+            .await
+        {
+            Ok((s, _)) => s,
+            Err(e) => {
+                return BtPortCheckReport {
+                    light: BtPortLight::Red,
+                    checked_at,
+                    listen_addr: "未监听".to_string(),
+                    listen_port: bt.listen_port,
+                    dual_stack: !bt.ipv4_only,
+                    encryption_mode: bt.encryption_mode,
+                    detected_tun_adapter,
+                    local_v4_ok: false,
+                    local_v6_ok: None,
+                    public_ipv4: None,
+                    public_ipv6: None,
+                    external_port_open: None,
+                    incoming_observed,
+                    dht_nodes_v4: 0,
+                    dht_nodes_v6: 0,
+                    summary: format!("BT 会话未能启动监听：{e}"),
+                    advice: "请检查端口是否被其他程序占用，或在 BT / Tracker 页面更换固定端口（如 16881 / 26881）".to_string(),
+                };
+            }
+        };
+
+        let listen_addr_opt = session.listen_addr();
+        let listen_port = session
+            .announce_port()
+            .or_else(|| listen_addr_opt.map(|a| a.port()))
+            .unwrap_or(bt.listen_port);
+        let dual_stack = listen_addr_opt
+            .map(|a| a.is_ipv6())
+            .unwrap_or(!bt.ipv4_only);
+        let listen_addr = listen_addr_opt
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| format!("0.0.0.0:{listen_port}"));
+        let (dht_nodes_v4, dht_nodes_v6) = session
+            .get_dht()
+            .map(|d| {
+                let ds = d.stats();
+                (ds.routing_table_size, ds.routing_table_size_v6)
+            })
+            .unwrap_or((0, 0));
+
+        let (local_v4_ok, local_v6_ok) = if listen_port > 0 {
+            let v4 = local_loopback_port_probe(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                listen_port,
+            )))
+            .await;
+            let v6 = if dual_stack {
+                Some(
+                    local_loopback_port_probe(SocketAddr::from((
+                        Ipv6Addr::LOCALHOST,
+                        listen_port,
+                    )))
+                    .await,
+                )
+            } else {
+                None
+            };
+            (v4, v6)
+        } else {
+            (false, None)
+        };
+
+        let (public_ipv4, public_ipv6, external_port_open) = tokio::join!(
+            probe_public_ip(&["https://api4.ipify.org", "https://4.ident.me"], proxy_url),
+            probe_public_ip(&["https://api6.ipify.org", "https://6.ident.me"], proxy_url),
+            probe_external_tcp_port(listen_port, proxy_url),
+        );
+
+        let (light, summary, mut advice) = evaluate_port_light(
+            listen_port,
+            dual_stack,
+            local_v4_ok,
+            local_v6_ok,
+            public_ipv6.is_some(),
+            external_port_open,
+            incoming_observed,
+            dht_nodes_v6,
+        );
+
+        if let Some(tun) = &detected_tun_adapter {
+            let tun_note = match bt.encryption_mode {
+                BtEncryptionMode::Disabled => format!(
+                    "检测到本机虚拟网卡（{tun}），当前协议加密已关闭，明文 BT 握手极易被 TUN/代理节点直接掐断！强烈建议开启「MSE/PE 优先加密」或将 Siphon 加入 TUN 绕过白名单。"
+                ),
+                BtEncryptionMode::PreferEncrypted | BtEncryptionMode::ForceEncrypted => format!(
+                    "检测到本机虚拟网卡（{tun}），已开启 MSE/PE 加密握手穿透明文拦截；如需绿灯入站或提升 DHT/uTP 性能，可将 siphon.exe 加入该 TUN 的直连/进程绕过规则。"
+                ),
+            };
+            advice = format!("{tun_note} | {advice}");
+        }
+
+        BtPortCheckReport {
+            light,
+            checked_at,
+            listen_addr,
+            listen_port,
+            dual_stack,
+            encryption_mode: bt.encryption_mode,
+            detected_tun_adapter,
+            local_v4_ok,
+            local_v6_ok,
+            public_ipv4,
+            public_ipv6,
+            external_port_open,
+            incoming_observed,
+            dht_nodes_v4,
+            dht_nodes_v6,
+            summary,
+            advice,
         }
     }
 
@@ -150,11 +426,65 @@ impl BitTorrentEngine {
         let _ = tokio::fs::create_dir_all(&base_dir).await;
 
         let dht_file = self.data_dir.as_ref().map(|d| d.join("bt-dht.json"));
-        let opts = build_session_options_with_dht_path(bt, proxy_url, dht_file);
+        let opts = build_session_options_with_dht_path(bt, proxy_url, dht_file.clone());
 
-        let session = Session::new_with_opts(fallback_dir.to_path_buf(), opts)
-            .await
-            .map_err(|e| SiphonError::Network(format!("BitTorrent 会话初始化失败: {e}")))?;
+        let session = match Session::new_with_opts(fallback_dir.to_path_buf(), opts).await {
+            Ok(s) => s,
+            Err(primary_err) => {
+                // Fallback 1: if a fixed port was already occupied, keep IPv4+IPv6 dual-stack on ephemeral port 0
+                let mut retry_bt = bt.clone();
+                let mut created = None;
+                if retry_bt.listen_port > 0 {
+                    retry_bt.listen_port = 0;
+                    let retry_opts = build_session_options_with_dht_path(
+                        &retry_bt,
+                        proxy_url,
+                        dht_file.clone(),
+                    );
+                    if let Ok(s) =
+                        Session::new_with_opts(fallback_dir.to_path_buf(), retry_opts).await
+                    {
+                        created = Some(s);
+                    }
+                }
+                // Fallback 2: if IPv6 is disabled at the OS/adapter level, gracefully fall back to IPv4
+                if created.is_none() && !bt.ipv4_only {
+                    let mut v4_bt = bt.clone();
+                    v4_bt.ipv4_only = true;
+                    let v4_opts = build_session_options_with_dht_path(
+                        &v4_bt,
+                        proxy_url,
+                        dht_file.clone(),
+                    );
+                    match Session::new_with_opts(fallback_dir.to_path_buf(), v4_opts).await {
+                        Ok(s) => created = Some(s),
+                        Err(_) if v4_bt.listen_port > 0 => {
+                            v4_bt.listen_port = 0;
+                            let v4_any_opts = build_session_options_with_dht_path(
+                                &v4_bt,
+                                proxy_url,
+                                dht_file,
+                            );
+                            if let Ok(s) =
+                                Session::new_with_opts(fallback_dir.to_path_buf(), v4_any_opts)
+                                    .await
+                            {
+                                created = Some(s);
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                match created {
+                    Some(s) => s,
+                    None => {
+                        return Err(SiphonError::Network(format!(
+                            "BitTorrent 会话初始化失败: {primary_err}"
+                        )));
+                    }
+                }
+            }
+        };
 
         *guard = Some(WarmSession {
             fingerprint: fp,
@@ -406,11 +736,17 @@ pub fn build_session_options_with_dht_path(
         None
     };
 
+    let listen_addr: SocketAddr = if bt.ipv4_only {
+        (Ipv4Addr::UNSPECIFIED, bt.listen_port).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, bt.listen_port).into()
+    };
+
     let listen = Some(ListenerOptions {
         mode: ListenerMode::TcpAndUtp,
-        listen_addr: (Ipv4Addr::UNSPECIFIED, bt.listen_port).into(),
+        listen_addr,
         enable_upnp_port_forwarding: bt.enable_upnp,
-        ipv4_only: true,
+        ipv4_only: bt.ipv4_only,
         ..Default::default()
     });
 
@@ -419,12 +755,23 @@ pub fn build_session_options_with_dht_path(
         .filter(|p| p.to_ascii_lowercase().starts_with("socks5://"))
         .map(str::to_string);
 
+    let connect_secs = bt.peer_connect_timeout_secs.clamp(3, 60);
+    let rw_secs = bt.peer_read_write_timeout_secs.clamp(15, 180);
+    let keep_alive_secs = (rw_secs * 2 / 3).clamp(15, 90);
+    let encryption_mode = match bt.encryption_mode {
+        BtEncryptionMode::PreferEncrypted => EncryptionMode::PreferEncrypted,
+        BtEncryptionMode::ForceEncrypted => EncryptionMode::ForceEncrypted,
+        BtEncryptionMode::Disabled => EncryptionMode::Disabled,
+    };
+
     let connect = Some(ConnectionOptions {
         enable_tcp: true,
         proxy_url: socks_proxy,
         peer_opts: Some(PeerConnectionOptions {
-            connect_timeout: Some(Duration::from_secs(bt.peer_connect_timeout_secs.clamp(2, 60))),
-            read_write_timeout: Some(Duration::from_secs(12)),
+            connect_timeout: Some(Duration::from_secs(connect_secs)),
+            read_write_timeout: Some(Duration::from_secs(rw_secs)),
+            keep_alive_interval: Some(Duration::from_secs(keep_alive_secs)),
+            encryption_mode: Some(encryption_mode),
             ..Default::default()
         }),
     });
@@ -448,8 +795,9 @@ pub fn build_session_options_with_dht_path(
         connect,
         trackers,
         peer_limit: Some(bt.max_peers_per_torrent.clamp(10, 500)),
-        ipv4_only: true,
-        client_name_and_version: Some(format!("Siphon/{}", env!("CARGO_PKG_VERSION"))),
+        ipv4_only: bt.ipv4_only,
+        // Keep librqbit's native client name consistent with its `-rQ...` peer_id to avoid anti-leech mismatch bans
+        client_name_and_version: None,
         ..Default::default()
     }
 }
@@ -643,19 +991,65 @@ impl ProtocolHandler for BitTorrentEngine {
             Some(files) if !files.is_empty() => format!("，仅下载勾选的 {} 个子文件", files.len()),
             _ => String::new(),
         };
+        let stack_label = if ctx.bt_config.ipv4_only {
+            "仅 IPv4"
+        } else {
+            "IPv4+IPv6双栈"
+        };
+        let enc_label = match ctx.bt_config.encryption_mode {
+            BtEncryptionMode::PreferEncrypted => "MSE/PE优先加密",
+            BtEncryptionMode::ForceEncrypted => "MSE/PE强制加密",
+            BtEncryptionMode::Disabled => "明文模式",
+        };
+        let bound_port = session
+            .announce_port()
+            .unwrap_or(ctx.bt_config.listen_port);
         push_log(
             &ctx,
             "info",
             format!(
-                "BitTorrent 会话{}（{} ms，TCP+uTP，DHT={}，注入 Tracker={} 条{}）-> {}",
+                "BitTorrent 会话{}（{} ms，{}，{}，TCP+uTP 端口 {}，超时 {}s/{}s，DHT={}，注入 Tracker={} 条{}）-> {}",
                 if reused { "热复用" } else { "已初始化" },
                 t0.elapsed().as_millis(),
+                stack_label,
+                enc_label,
+                bound_port,
+                ctx.bt_config.peer_connect_timeout_secs.clamp(3, 60),
+                ctx.bt_config.peer_read_write_timeout_secs.clamp(15, 180),
                 ctx.bt_config.enable_dht,
                 tracker_count,
                 selected_note,
                 output_dir.display()
             ),
         );
+
+        let bound_addr_str = session
+            .listen_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| format!("0.0.0.0:{bound_port}"));
+        let actual_dual_stack = session
+            .listen_addr()
+            .map(|a| a.is_ipv6())
+            .unwrap_or(!ctx.bt_config.ipv4_only);
+        let initial_hash = parse_magnet_info_hash(&ctx.task.original_url).unwrap_or_default();
+        let (init_dht_v4, init_dht_v6) = session
+            .get_dht()
+            .map(|d| {
+                let ds = d.stats();
+                (ds.routing_table_size, ds.routing_table_size_v6)
+            })
+            .unwrap_or((0, 0));
+        let _ = ctx.updates_tx.send(EngineUpdate::BtTelemetry(BtLiveTelemetry {
+            info_hash: initial_hash,
+            phase: "拉取元数据".to_string(),
+            listen_addr: bound_addr_str.clone(),
+            listen_port: bound_port,
+            dual_stack: actual_dual_stack,
+            tracker_count,
+            dht_nodes_v4: init_dht_v4,
+            dht_nodes_v6: init_dht_v6,
+            ..Default::default()
+        }));
 
         let raw_url = ctx.task.original_url.trim().to_string();
         let add_req = if let Some(local_path) = local_torrent_path_from_url(&raw_url) {
@@ -688,6 +1082,7 @@ impl ProtocolHandler for BitTorrentEngine {
             }
         };
 
+        let resolved_info_hash = handle.info_hash().as_string();
         push_log(
             &ctx,
             "info",
@@ -699,6 +1094,7 @@ impl ProtocolHandler for BitTorrentEngine {
 
         let mut metadata_emitted = false;
         let mut last_peer_summary = (0u32, 0u32);
+        let mut tick_idx = 0u64;
 
         loop {
             if ctx.cancel.is_cancelled() {
@@ -762,6 +1158,125 @@ impl ProtocolHandler for BitTorrentEngine {
                     format!("Peer 状态：活跃连接 {live_peers} · 已发现 {seen_peers}"),
                 );
             }
+
+            if tick_idx.is_multiple_of(2) || stats.finished {
+                let (dht_v4, dht_v6) = session
+                    .get_dht()
+                    .map(|d| {
+                        let ds = d.stats();
+                        (ds.routing_table_size, ds.routing_table_size_v6)
+                    })
+                    .unwrap_or((0, 0));
+
+                let total_pieces = handle
+                    .with_metadata(|m| m.info.lengths().total_pieces() as u64)
+                    .unwrap_or(0);
+
+                let mut live_ipv6 = 0u32;
+                let mut incoming_peers = 0u32;
+                let mut top_peers = Vec::new();
+                if let Some(live_handle) = handle.live() {
+                    let peer_snap = live_handle.per_peer_stats_snapshot(Default::default());
+                    for (addr, ps) in peer_snap.peers {
+                        let is_ipv6 = addr.starts_with('[');
+                        let incoming = ps.counters.incoming_connections > 0;
+                        if is_ipv6 {
+                            live_ipv6 += 1;
+                        }
+                        if incoming {
+                            incoming_peers += 1;
+                            self.incoming_observed.store(true, Ordering::Relaxed);
+                        }
+                        let transport = ps
+                            .conn_kind
+                            .map(|k| k.to_string().to_ascii_uppercase())
+                            .unwrap_or_else(|| "TCP".to_string());
+                        top_peers.push(BtPeerBrief {
+                            addr,
+                            is_ipv6,
+                            transport,
+                            incoming,
+                            client: ps.client_name.unwrap_or_default(),
+                            downloaded_bytes: ps.counters.fetched_bytes,
+                            uploaded_bytes: ps.counters.uploaded_bytes,
+                        });
+                    }
+                    top_peers.sort_by(|a, b| {
+                        (b.downloaded_bytes + b.uploaded_bytes)
+                            .cmp(&(a.downloaded_bytes + a.uploaded_bytes))
+                            .then_with(|| b.incoming.cmp(&a.incoming))
+                    });
+                    top_peers.truncate(8);
+                }
+
+                let (
+                    live_tcp,
+                    live_utp,
+                    live_seeders,
+                    connecting_peers,
+                    queued_peers,
+                    dead_peers,
+                    upload_speed_bps,
+                    uploaded_bytes,
+                    checked_pieces,
+                ) = if let Some(live) = stats.live.as_ref() {
+                    let ps = &live.snapshot.peer_stats;
+                    (
+                        ps.live_tcp,
+                        ps.live_utp,
+                        ps.live_seeders,
+                        ps.connecting,
+                        ps.queued,
+                        ps.dead,
+                        (live.upload_speed.mbps * 1024.0 * 1024.0).max(0.0) as u64,
+                        stats.uploaded_bytes.max(live.snapshot.uploaded_bytes),
+                        live.snapshot.downloaded_and_checked_pieces,
+                    )
+                } else {
+                    (0, 0, 0, 0, 0, 0, 0, stats.uploaded_bytes, 0)
+                };
+
+                let phase = if stats.finished {
+                    "已完成"
+                } else if stats.total_bytes == 0 {
+                    "拉取元数据"
+                } else if live_peers > 0 && speed_bps > 0 {
+                    "Swarm 传输中"
+                } else if live_peers > 0 {
+                    "已连节点等待数据"
+                } else if connecting_peers > 0 || seen_peers > 0 {
+                    "正在连接 Peer"
+                } else {
+                    "正在搜寻节点"
+                };
+
+                let _ = ctx.updates_tx.send(EngineUpdate::BtTelemetry(BtLiveTelemetry {
+                    info_hash: resolved_info_hash.clone(),
+                    phase: phase.to_string(),
+                    listen_addr: bound_addr_str.clone(),
+                    listen_port: bound_port,
+                    dual_stack: actual_dual_stack,
+                    live_peers,
+                    live_tcp,
+                    live_utp,
+                    live_seeders,
+                    live_ipv6,
+                    incoming_peers,
+                    connecting_peers,
+                    queued_peers,
+                    seen_peers,
+                    dead_peers,
+                    upload_speed_bps,
+                    uploaded_bytes,
+                    checked_pieces,
+                    total_pieces,
+                    tracker_count,
+                    dht_nodes_v4: dht_v4,
+                    dht_nodes_v6: dht_v6,
+                    top_peers,
+                }));
+            }
+            tick_idx = tick_idx.wrapping_add(1);
 
             let segments = build_bt_segments(
                 stats.total_bytes,
@@ -858,6 +1373,186 @@ fn build_bt_segments(
     out
 }
 
+pub fn parse_magnet_info_hash(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw.trim()).ok()?;
+    for (k, v) in parsed.query_pairs() {
+        if k == "xt"
+            && let Some(hash) = v.rsplit(':').next()
+            && !hash.trim().is_empty()
+        {
+            return Some(hash.trim().to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Detect active TUN / virtual proxy network adapters (e.g. `singbox_tun`, Clash, Mihomo, Wintun)
+/// that often sniff & intercept plaintext BitTorrent traffic or block incoming P2P ports.
+pub fn detect_tun_adapter() -> Option<String> {
+    let ifaces = NetworkInterface::show().ok()?;
+    for iface in ifaces {
+        if iface.addr.is_empty() {
+            continue;
+        }
+        let low = iface.name.to_ascii_lowercase();
+        let is_tun = low.contains("singbox")
+            || low.contains("sing-box")
+            || low.contains("sing-tun")
+            || low.contains("clash")
+            || low.contains("mihomo")
+            || low.contains("wintun")
+            || low.contains("flclash")
+            || low.contains("nekobox")
+            || low.contains("nekoray")
+            || low.contains("v2ray")
+            || low.contains("metacubex")
+            || low.starts_with("tun")
+            || low.starts_with("utun")
+            || low.ends_with("_tun");
+        if is_tun {
+            return Some(iface.name);
+        }
+    }
+    None
+}
+
+async fn local_loopback_port_probe(addr: SocketAddr) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_millis(900), TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
+}
+
+async fn probe_public_ip(endpoints: &[&str], proxy_url: Option<&str>) -> Option<String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .user_agent(format!("Siphon/{}", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = proxy_url
+        && !proxy.trim().is_empty()
+        && let Ok(p) = reqwest::Proxy::all(proxy.trim())
+    {
+        builder = builder.proxy(p);
+    }
+    let client = builder.build().ok()?;
+    for url in endpoints {
+        if let Ok(resp) = client.get(*url).send().await
+            && resp.status().is_success()
+            && let Ok(txt) = resp.text().await
+        {
+            let trimmed = txt.trim();
+            if !trimmed.is_empty() && trimmed.len() <= 64 && !trimmed.contains('<') {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn probe_external_tcp_port(port: u16, proxy_url: Option<&str>) -> Option<bool> {
+    if port == 0 {
+        return None;
+    }
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .user_agent(format!("Siphon/{}", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = proxy_url
+        && !proxy.trim().is_empty()
+        && let Ok(p) = reqwest::Proxy::all(proxy.trim())
+    {
+        builder = builder.proxy(p);
+    }
+    let client = builder.build().ok()?;
+
+    let primary_url = format!("https://portcheck.transmissionbt.com/{port}");
+    if let Ok(resp) = client.get(&primary_url).send().await
+        && resp.status().is_success()
+        && let Ok(txt) = resp.text().await
+    {
+        match txt.trim() {
+            "1" => return Some(true),
+            "0" => return Some(false),
+            _ => {}
+        }
+    }
+
+    let fallback_url = format!("https://ifconfig.co/port/{port}");
+    if let Ok(resp) = client
+        .get(&fallback_url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        && resp.status().is_success()
+        && let Ok(txt) = resp.text().await
+    {
+        if txt.contains("\"reachable\":true") || txt.contains("\"reachable\": true") {
+            return Some(true);
+        }
+        if txt.contains("\"reachable\":false") || txt.contains("\"reachable\": false") {
+            return Some(false);
+        }
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_port_light(
+    listen_port: u16,
+    dual_stack: bool,
+    local_v4_ok: bool,
+    local_v6_ok: Option<bool>,
+    has_public_ipv6: bool,
+    external_port_open: Option<bool>,
+    incoming_observed: bool,
+    dht_nodes_v6: usize,
+) -> (BtPortLight, String, String) {
+    let local_ok = local_v4_ok || local_v6_ok == Some(true);
+    if listen_port == 0 || !local_ok {
+        return (
+            BtPortLight::Red,
+            format!("红灯 · 本地端口 :{listen_port} 未响应监听"),
+            "本地 BT 监听套接字未就绪，请检查端口占用或 Windows 防火墙拦截后重试".to_string(),
+        );
+    }
+
+    if external_port_open == Some(true) || incoming_observed {
+        let via = if external_port_open == Some(true) && incoming_observed {
+            "外网端口探测开放，且已实测收到外部 Peer 主动连入"
+        } else if external_port_open == Some(true) {
+            "外网 TCP 端口探测开放，外部 Peer 可直接连入"
+        } else {
+            "本会话已实测收到外部 Peer 主动入站连接"
+        };
+        return (
+            BtPortLight::Green,
+            format!("绿灯 · 端口 :{listen_port} 入站畅通"),
+            format!("{via}，当前处于最佳 P2P 互联状态"),
+        );
+    }
+
+    if dual_stack && local_v6_ok == Some(true) && (has_public_ipv6 || dht_nodes_v6 > 0) {
+        return (
+            BtPortLight::Green,
+            format!("绿灯 · IPv6 双栈可达 (:{listen_port})"),
+            if external_port_open == Some(false) {
+                "IPv4 处于 NAT/防火墙后，但检测到公网 IPv6 双栈可用，IPv6 Peer 可直连互通（如需 IPv4 也绿灯，请在路由器转发此端口）".to_string()
+            } else {
+                "检测到公网 IPv6 双栈就绪，支持直连 IPv6 公网 Peer 与双栈 DHT".to_string()
+            },
+        );
+    }
+
+    let summary = if external_port_open == Some(false) {
+        format!("黄灯 · 端口 :{listen_port} 外网入站阻塞（仅出站）")
+    } else {
+        format!("黄灯 · 本地 :{listen_port} 监听正常，外网入站未确认")
+    };
+    let advice = format!(
+        "当前仅能主动外连公网 Peer（类似黄灯阻塞）。改善建议：1) 检查路由器是否开启 IPv6；2) 在路由器为 TCP/UDP 端口 {listen_port} 配置端口转发或开启 UPnP；3) 在 Windows 防火墙放行 Siphon 入站"
+    );
+    (BtPortLight::Yellow, summary, advice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,13 +1594,39 @@ mod tests {
 
     #[test]
     fn build_session_and_add_options_applies_custom_trackers_and_network_flags() {
+        // Default config enables IPv4+IPv6 dual-stack on fixed port 16881 with relaxed timeouts & native rqbit identity
+        let default_bt = BtConfig::default();
+        let default_sess = build_session_options(&default_bt, None);
+        assert!(!default_sess.ipv4_only);
+        assert!(default_sess.client_name_and_version.is_none());
+        let def_listen = default_sess.listen.expect("default listen present");
+        assert!(def_listen.listen_addr.is_ipv6());
+        assert_eq!(def_listen.listen_addr.port(), 16881);
+        assert!(!def_listen.ipv4_only);
+        let def_peer_opts = default_sess
+            .connect
+            .as_ref()
+            .and_then(|c| c.peer_opts)
+            .expect("peer opts present");
+        assert_eq!(def_peer_opts.connect_timeout, Some(Duration::from_secs(12)));
+        assert_eq!(
+            def_peer_opts.read_write_timeout,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            def_peer_opts.keep_alive_interval,
+            Some(Duration::from_secs(40))
+        );
+
         let bt = BtConfig {
             enable_dht: false,
             enable_lsd: false,
             enable_upnp: true,
             disable_trackers: false,
+            ipv4_only: true,
             listen_port: 6889,
-            peer_connect_timeout_secs: 5,
+            peer_connect_timeout_secs: 15,
+            peer_read_write_timeout_secs: 90,
             max_peers_per_torrent: 200,
             auto_append_trackers: true,
             custom_trackers: vec![
@@ -926,12 +1647,17 @@ mod tests {
         assert_eq!(sess.peer_limit, Some(200));
         assert_eq!(sess.trackers.len(), 3);
         let listen = sess.listen.expect("listen options present");
+        assert!(listen.listen_addr.is_ipv4());
         assert_eq!(listen.listen_addr.port(), 6889);
         assert!(listen.enable_upnp_port_forwarding);
         assert_eq!(
             sess.connect.as_ref().and_then(|c| c.proxy_url.as_deref()),
             Some("socks5://127.0.0.1:1080")
         );
+        let peer_opts = sess.connect.as_ref().and_then(|c| c.peer_opts).unwrap();
+        assert_eq!(peer_opts.connect_timeout, Some(Duration::from_secs(15)));
+        assert_eq!(peer_opts.read_write_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(peer_opts.keep_alive_interval, Some(Duration::from_secs(60)));
 
         let add = build_add_torrent_options_for_dir(&bt, Some(Path::new(r"D:\Downloads")));
         assert_eq!(add.output_folder.as_deref(), Some(r"D:\Downloads"));
@@ -1068,5 +1794,149 @@ mod tests {
 
         let add = build_add_torrent_options_with_files(&bt, Some(dir.path()), Some(&[0, 1]));
         assert_eq!(add.only_files, Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn port_light_verdict_classifies_green_yellow_and_red_accurately() {
+        // Red: local loopback failed
+        let (l_red, _, _) = evaluate_port_light(16881, true, false, Some(false), false, None, false, 0);
+        assert_eq!(l_red, BtPortLight::Red);
+
+        // Green: external port open
+        let (l_green_ext, _, _) =
+            evaluate_port_light(16881, true, true, Some(true), false, Some(true), false, 0);
+        assert_eq!(l_green_ext, BtPortLight::Green);
+
+        // Green: public IPv6 dual-stack reachable even if IPv4 NATed
+        let (l_green_v6, _, _) =
+            evaluate_port_light(16881, true, true, Some(true), true, Some(false), false, 12);
+        assert_eq!(l_green_v6, BtPortLight::Green);
+
+        // Yellow: local OK, but external closed & no public IPv6 / inbound
+        let (l_yellow, _, advice) =
+            evaluate_port_light(16881, true, true, Some(true), false, Some(false), false, 0);
+        assert_eq!(l_yellow, BtPortLight::Yellow);
+        assert!(advice.contains("16881"));
+    }
+
+    #[tokio::test]
+    async fn live_session_status_and_local_loopback_probe_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = BitTorrentEngine::with_data_dir(dir.path().to_path_buf());
+        let bt = BtConfig {
+            enable_dht: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            disable_trackers: true,
+            listen_port: 0,
+            auto_append_trackers: false,
+            ..Default::default()
+        };
+
+        let before = engine.live_session_status(&bt).await;
+        assert!(!before.session_ready);
+
+        let (_s, _) = engine
+            .get_or_create_session(&bt, dir.path(), None)
+            .await
+            .unwrap();
+
+        let after = engine.live_session_status(&bt).await;
+        assert!(after.session_ready);
+        assert!(after.listen_port > 0);
+        assert!(local_loopback_port_probe(SocketAddr::from((Ipv4Addr::LOCALHOST, after.listen_port))).await);
+    }
+
+    #[tokio::test]
+    async fn encrypted_mse_sessions_transfer_torrent_over_loopback() {
+        let seed_dir = tempfile::tempdir().unwrap();
+        let leech_dir = tempfile::tempdir().unwrap();
+
+        // Create a 128 KiB deterministic payload and package it into a real `.torrent`
+        let payload: Vec<u8> = (0..131_072usize)
+            .map(|i| ((i * 73 + 19) % 251) as u8)
+            .collect();
+        let src_file = seed_dir.path().join("encrypted_sample.bin");
+        tokio::fs::write(&src_file, &payload).await.unwrap();
+
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
+        let created = librqbit::create_torrent(
+            &src_file,
+            librqbit::CreateTorrentOptions {
+                piece_length: Some(32 * 1024),
+                ..Default::default()
+            },
+            &spawner,
+        )
+        .await
+        .unwrap();
+        let torrent_bytes = created.as_bytes().unwrap();
+
+        let bt = BtConfig {
+            enable_dht: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            disable_trackers: true,
+            ipv4_only: true,
+            encryption_mode: BtEncryptionMode::ForceEncrypted,
+            listen_port: 0,
+            auto_append_trackers: false,
+            ..Default::default()
+        };
+
+        let seeder = Session::new_with_opts(
+            seed_dir.path().to_path_buf(),
+            build_session_options(&bt, None),
+        )
+        .await
+        .unwrap();
+        let seeder_port = seeder.listen_addr().unwrap().port();
+        let seeder_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, seeder_port));
+
+        let _seed_resp = seeder
+            .add_torrent(
+                AddTorrent::from_bytes(torrent_bytes.clone()),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let leecher = Session::new_with_opts(
+            leech_dir.path().to_path_buf(),
+            build_session_options(&bt, None),
+        )
+        .await
+        .unwrap();
+
+        let leech_resp = leecher
+            .add_torrent(
+                AddTorrent::from_bytes(torrent_bytes),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    disable_trackers: true,
+                    initial_peers: Some(vec![seeder_addr]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let leech_handle = leech_resp.into_handle().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), leech_handle.wait_until_completed())
+            .await
+            .expect("MSE/PE ForceEncrypted loopback transfer timed out")
+            .unwrap();
+
+        let downloaded = tokio::fs::read(leech_dir.path().join("encrypted_sample.bin"))
+            .await
+            .unwrap();
+        assert_eq!(downloaded, payload);
+
+        leecher.stop().await;
+        seeder.stop().await;
     }
 }

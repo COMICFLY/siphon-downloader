@@ -429,6 +429,7 @@ impl DownloadManager {
             segments: Vec::new(),
             speed_history: Vec::new(),
             logs: Vec::new(),
+            bt_telemetry: None,
         };
 
         if let Some(note) = resolved.note {
@@ -771,6 +772,17 @@ impl DownloadManager {
                             speed_bps,
                             eta_secs,
                             segments,
+                        });
+                    }
+                    EngineUpdate::BtTelemetry(telemetry) => {
+                        let mut tasks = mgr_updates.tasks.write().await;
+                        if let Some(t) = tasks.get_mut(&id) {
+                            t.bt_telemetry = Some(telemetry.clone());
+                        }
+                        drop(tasks);
+                        let _ = mgr_updates.events_tx.send(TaskEvent::BtTelemetry {
+                            task_id: id,
+                            telemetry,
                         });
                     }
                     EngineUpdate::Verifying => {

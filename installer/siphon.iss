@@ -1,6 +1,6 @@
 ; Siphon Downloader — Windows Standard Installer Script (Inno Setup 6)
 #define MyAppName "Siphon Downloader"
-#define MyAppVersion "0.7.0"
+#define MyAppVersion "0.8.0"
 #define MyAppPublisher "COMICFLY"
 #define MyAppURL "https://github.com/COMICFLY/siphon-downloader"
 #define MyAppExeName "siphon.exe"

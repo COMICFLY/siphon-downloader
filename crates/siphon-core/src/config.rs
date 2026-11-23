@@ -147,6 +147,19 @@ pub fn parse_tracker_list(raw: &str) -> Vec<String> {
     out
 }
 
+/// BitTorrent MSE/PE protocol stream encryption mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BtEncryptionMode {
+    /// Attempt MSE/PE (768-bit DH + RC4) encrypted handshake first; fall back to plaintext if peer rejects MSE.
+    #[default]
+    PreferEncrypted,
+    /// Require MSE/PE RC4 encryption for all outgoing and incoming BitTorrent connections.
+    ForceEncrypted,
+    /// Plaintext BitTorrent handshakes only (not recommended behind TUN proxies or strict ISPs).
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BtConfig {
@@ -158,10 +171,19 @@ pub struct BtConfig {
     pub enable_upnp: bool,
     /// Disable tracker announcements completely (DHT-only mode).
     pub disable_trackers: bool,
-    /// Incoming TCP/uTP listen port (`0` = automatic random port).
+    /// Restrict BitTorrent to IPv4 only (`false` = IPv4+IPv6 dual-stack, strongly recommended).
+    #[serde(default)]
+    pub ipv4_only: bool,
+    /// BitTorrent MSE/PE stream encryption mode (default: `PreferEncrypted`).
+    #[serde(default)]
+    pub encryption_mode: BtEncryptionMode,
+    /// Incoming TCP/uTP listen port (fixed default `16881`; `0` = automatic random port).
     pub listen_port: u16,
-    /// Peer TCP connection timeout in seconds.
+    /// Peer TCP/uTP connection timeout in seconds.
     pub peer_connect_timeout_secs: u64,
+    /// Peer socket read/write idle timeout in seconds (higher values prevent dropping choked peers).
+    #[serde(default = "default_bt_rw_timeout_secs")]
+    pub peer_read_write_timeout_secs: u64,
     /// Maximum concurrent peers per torrent task.
     pub max_peers_per_torrent: usize,
     /// Automatically append custom & subscribed trackers to every magnet / `.torrent` task.
@@ -178,6 +200,10 @@ pub struct BtConfig {
     pub auto_sync_trackers_on_start: bool,
 }
 
+fn default_bt_rw_timeout_secs() -> u64 {
+    60
+}
+
 impl Default for BtConfig {
     fn default() -> Self {
         Self {
@@ -185,8 +211,11 @@ impl Default for BtConfig {
             enable_lsd: true,
             enable_upnp: true,
             disable_trackers: false,
-            listen_port: 0,
-            peer_connect_timeout_secs: 5,
+            ipv4_only: false,
+            encryption_mode: BtEncryptionMode::PreferEncrypted,
+            listen_port: 16881,
+            peer_connect_timeout_secs: 12,
+            peer_read_write_timeout_secs: default_bt_rw_timeout_secs(),
             max_peers_per_torrent: 160,
             auto_append_trackers: true,
             custom_trackers: vec![

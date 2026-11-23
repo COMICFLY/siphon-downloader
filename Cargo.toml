@@ -10,9 +10,10 @@ members = [
     "crates/siphon-gui",
     "crates/siphon-native-host",
 ]
+exclude = ["vendor/librqbit"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 
@@ -83,3 +84,6 @@ axum = "0.8"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }

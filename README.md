@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.7.0-38BDF8?style=flat-square" alt="Release" /></a>
+  <a href="https://github.com/COMICFLY/siphon-downloader/releases"><img src="https://img.shields.io/badge/release-v0.8.0-38BDF8?style=flat-square" alt="Release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-0EA5E9?style=flat-square" alt="Platform" />
   <img src="https://img.shields.io/badge/language-Rust%202024-F97316?style=flat-square" alt="Rust" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="License" /></a>
@@ -33,7 +33,7 @@
 ### 1. 高性能纯 Rust 多协议下载引擎（HTTP / HLS / BitTorrent / eD2k）
 - **HTTP/HTTPS 真多线程并发引擎**：基于独立 HTTP/1.1 TCP 并发连接与 `TCP_NODELAY`，避免 HTTP/2 单连接流控瓶颈，充分跑满千兆宽带（实测单任务峰值突破 `130 MB/s`）；内置**动态二分借片（Dynamic Work Stealing）**、**256 KB 写缓冲合并落盘**、SQLite 分片断点续传、过期直链无缝替换、分级令牌桶限速与 **SHA-256 / MD5 / BLAKE3** 哈希校验。
 - **HLS（`.m3u8`）流媒体引擎**：原生纯 Rust 解析 Master / Media 播放列表（自动选择最高码率流），支持 **AES-128-CBC 分片实时解密**、并发分片拉取与断点续传、按序无损合并输出。
-- **BitTorrent / Magnet 协议与独立「BT / Tracker」菜单**：基于纯 Rust `librqbit` 驱动，采用**应用启动后台预热共享会话 + 持久化 DHT 路由表（`bt-dht.json`）+ TCP/uTP 双栈 + IPv4 优先直连 + 16 组高速默认 Tracker**，大幅缩短磁力/种子会话与元数据初始化时间；独立 **BT / Tracker** 页面提供 DHT / LSD / UPnP / 监听端口 / 最大 Peer / 连接超时设置、**自定义 Tracker 批量增删与剪贴板导入**，以及**公共 Tracker 订阅源一键同步与启动自动刷新**。
+- **BitTorrent / Magnet 协议与独立「BT / Tracker」菜单**：基于深度增强的纯 Rust `librqbit` 驱动，原生支持 **MSE/PE 协议加密（768-bit DH + RC4 全流加密，支持优先加密 / 强制加密 / 明文三档切换，穿透 TUN 代理与运营商明文 BT 拦截并兼容强制加密节点）**、**IPv4+IPv6 双栈 `[::]` 监听**、固定默认端口（`16881`）、放宽连接与读写空闲超时、**应用启动后台预热共享会话 + 持久化 DHT 路由表（`bt-dht.json`）+ 16 组高速默认 Tracker**；独立 **BT / Tracker** 页面内置**实时连接状态与红/黄/绿灯端口可达性诊断**（本地 IPv4/IPv6 环回、公网 IPv4/IPv6、外网 TCP 端口探测、本机 TUN 虚拟网卡识别与排障建议）、自定义 Tracker 批量管理与公共 Tracker 订阅源一键同步；选中磁力/种子任务时，右侧切换为**专属 BT Swarm 详情卡片**，实时呈现 BTIH 哈希、红黄绿灯端口状态、活跃/做种/入站/IPv6 Peer 统计、双向下载+上传速率与分享率、已连入节点列表与子文件重选入口。
 - **eD2k 电驴协议与独立「eD2k 电驴」菜单**：原生纯 Rust 实现 `ed2k://|file|...` 链接解析、9,728,000 字节分块 **RFC 1320 MD4 完整性校验**、标准二进制 `server.met` 服务器列表订阅解析与节点 TCP 实时连通测速；独立 **eD2k 电驴** 页面提供昵称、TCP/Kad UDP 端口、Kad 网络、协议加密混淆、来源数/上传限速与服务器节点管理。
 
 ### 2. 计划调度、完成动作与批量通配符队列
@@ -81,6 +81,7 @@
 - [x] **批量通配符队列导入**（v0.3.0）：支持 `[001-100]`、`[1-20:2]`、`[a-z]` 序号/字母通配符展开、多行粘贴与关键词过滤预览。
 - [x] **应用内一键下载并自动静默更新**（v0.3.0）：软件内实时进度下载新版本安装包，完成后自动静默覆盖升级并重启。
 - [x] **BitTorrent 多文件按需勾选与 eD2k 资源选择窗**（v0.7.0）：独立「种子 / eD2k 选择下载窗」，支持 `.torrent` / `magnet:?` 子文件精确勾选下载及批量 `ed2k://` 链接解析去重勾选。
+- [x] **纯 Rust MSE/PE 协议加密、IPv4+IPv6 双栈、实时端口诊断与 BT 专属右侧卡片**（v0.8.0）：新增 768-bit DH + RC4 全流加密握手（穿透 TUN 代理与明文拦截）、双栈默认监听、红/黄/绿灯端口可达性检测与 TUN 虚拟网卡诊断、以及磁力/种子专属 Swarm 右侧详情面板。
 - [ ] **DASH（`.mpd`）音视频分离流封装**：支持 DASH 音视频轨合并封装为 MP4 / MKV。
 - [ ] **站点凭证与高级网络控制**：支持按域名独立配置 HTTP Basic / Cookie / 自定义 Header、分域名限速、以及 HTTP/SOCKS5 代理分流规则。
 - [ ] **局域网 / WebUI 远程管理**：内置轻量 REST API 与 Web 控制台，支持手机或局域网其他设备远程推送下载任务并查看进度。
@@ -91,11 +92,11 @@
 
 前往 [**GitHub Releases**](https://github.com/COMICFLY/siphon-downloader/releases) 下载对应文件：
 
-1. **`Siphon-Setup-0.7.0-x64.exe`（推荐）**：标准 Windows 安装包
+1. **`Siphon-Setup-0.8.0-x64.exe`（推荐）**：标准 Windows 安装包
    - 支持自由选择**程序安装目录**与**数据存储目录**；
    - 支持勾选创建桌面快捷方式与**开机静默启动**；
-   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.7.0.zip` 扩展压缩包。
-2. **`siphon-browser-extension-v0.7.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
+   - 安装目录内自带独立的 `browser-extension\` 文件夹与 `siphon-browser-extension-v0.8.0.zip` 扩展压缩包。
+2. **`siphon-browser-extension-v0.8.0.zip`**：独立的 Chrome / Edge / Brave / Vivaldi 浏览器扩展压缩包
    - 解压后打开浏览器的 `chrome://extensions` 或 `edge://extensions`；
    - 开启右上角 **「开发者模式」**，将解压出的文件夹直接拖入浏览器扩展页即可完成加载。
 

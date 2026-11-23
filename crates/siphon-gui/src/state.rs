@@ -1,8 +1,10 @@
 use iced::{Point, window};
 use siphon_core::{
-    AppConfig, AutomationRule, DownloadTask, ExternalPlugin, FileCategory, Language, ListDensity,
-    ProbePreview, QueueCompleteAction, TaskEvent, TaskId, TaskSource, ThemeMode,
+    AppConfig, AutomationRule, BtEncryptionMode, DownloadTask, ExternalPlugin, FileCategory,
+    Language, ListDensity, ProbePreview, QueueCompleteAction, TaskEvent, TaskId, TaskSource,
+    ThemeMode,
 };
+use siphon_engine_bt::{BtPortCheckReport, BtSessionStatusSnapshot};
 use siphon_engine_http::{SniffedWebItem, UpdateInfo};
 use siphon_platform_win::{
     DetectedBrowser, DropEvent, FileIconBitmap, FileIconKey, IpcCommand, TrayAction, WinHookEvent,
@@ -76,6 +78,7 @@ pub enum InputTarget {
     BtListenPort,
     BtMaxPeers,
     BtConnectTimeout,
+    BtRwTimeout,
     BtNewTracker,
     BtNewSubscribeUrl,
     Ed2kNickname,
@@ -520,12 +523,15 @@ pub enum Message {
     BtToggleDht(bool),
     BtToggleLsd(bool),
     BtToggleUpnp(bool),
+    BtToggleIpv6DualStack(bool),
+    BtSetEncryptionMode(BtEncryptionMode),
     BtToggleDisableTrackers(bool),
     BtToggleAutoAppend(bool),
     BtToggleAutoSyncOnStart(bool),
     BtListenPortChanged(String),
     BtMaxPeersChanged(String),
     BtConnectTimeoutChanged(String),
+    BtRwTimeoutChanged(String),
     BtNewTrackerChanged(String),
     BtAddTracker,
     BtPasteTrackersClipboard,
@@ -539,6 +545,10 @@ pub enum Message {
     BtSyncTrackersFinished(std::result::Result<(Vec<String>, usize, usize), String>),
     BtClearSyncedTrackers,
     BtSave,
+    BtSessionStatusUpdated(BtSessionStatusSnapshot),
+    BtCheckPort,
+    BtPortCheckFinished(BtPortCheckReport),
+    CopyTextToClipboard(String),
 
     // eD2k dedicated workspace
     Ed2kToggleEnabled(bool),

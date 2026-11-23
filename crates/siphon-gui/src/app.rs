@@ -26,7 +26,10 @@ use siphon_core::{
     infer_filename_from_raw_url, is_time_in_window, parse_hhmm, parse_tracker_list,
     sanitize_filename,
 };
-use siphon_engine_bt::{BitTorrentEngine, is_bittorrent_url, sync_trackers_from_urls};
+use siphon_engine_bt::{
+    BitTorrentEngine, BtPortCheckReport, BtSessionStatusSnapshot, is_bittorrent_url,
+    sync_trackers_from_urls,
+};
 use siphon_engine_ed2k::{
     Ed2kEngine, extract_ed2k_file_links, is_ed2k_file_link, parse_ed2k_server_link,
     sync_servers_from_met, test_ed2k_server,
@@ -189,14 +192,18 @@ pub struct SiphonApp {
     sched_last_stop_day: Option<(i32, u32, u32)>,
     sched_speed_window_active: bool,
 
-    // BitTorrent & Tracker page buffers
+    // BitTorrent & Tracker page buffers + live telemetry / port probe state
     bt_listen_port_input: String,
     bt_max_peers_input: String,
     bt_timeout_input: String,
+    bt_rw_timeout_input: String,
     bt_new_tracker_input: String,
     bt_new_sub_url_input: String,
     bt_syncing_trackers: bool,
     bt_sync_status: Option<String>,
+    bt_session_status: BtSessionStatusSnapshot,
+    bt_port_report: Option<BtPortCheckReport>,
+    bt_checking_port: bool,
 
     // eD2k page buffers
     ed2k_tcp_port_input: String,
@@ -259,6 +266,7 @@ impl SiphonApp {
         let bt_listen_port_input = config.bt.listen_port.to_string();
         let bt_max_peers_input = config.bt.max_peers_per_torrent.to_string();
         let bt_timeout_input = config.bt.peer_connect_timeout_secs.to_string();
+        let bt_rw_timeout_input = config.bt.peer_read_write_timeout_secs.to_string();
         let ed2k_tcp_port_input = config.ed2k.tcp_port.to_string();
         let ed2k_udp_port_input = config.ed2k.udp_port.to_string();
         let ed2k_max_sources_input = config.ed2k.max_sources_per_file.to_string();
@@ -358,10 +366,14 @@ impl SiphonApp {
             bt_listen_port_input,
             bt_max_peers_input,
             bt_timeout_input,
+            bt_rw_timeout_input,
             bt_new_tracker_input: String::new(),
             bt_new_sub_url_input: String::new(),
             bt_syncing_trackers: false,
             bt_sync_status: None,
+            bt_session_status: BtSessionStatusSnapshot::default(),
+            bt_port_report: None,
+            bt_checking_port: false,
             ed2k_tcp_port_input,
             ed2k_udp_port_input,
             ed2k_max_sources_input,
@@ -1484,9 +1496,13 @@ impl SiphonApp {
                             .is_none_or(|prev| prev.status != TaskStatus::Completed);
                     if let Some(slot) = self.tasks.iter_mut().find(|t| t.id == updated.id) {
                         let prev_hist = std::mem::take(&mut slot.speed_history);
+                        let prev_bt_tel = slot.bt_telemetry.take();
                         *slot = updated;
                         if slot.speed_history.is_empty() {
                             slot.speed_history = prev_hist;
+                        }
+                        if slot.bt_telemetry.is_none() {
+                            slot.bt_telemetry = prev_bt_tel;
                         }
                     } else {
                         self.tasks.insert(0, updated);
@@ -1635,6 +1651,11 @@ impl SiphonApp {
                             let d = task.logs.len() - 80;
                             task.logs.drain(0..d);
                         }
+                    }
+                }
+                TaskEvent::BtTelemetry { task_id, telemetry } => {
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                        task.bt_telemetry = Some(telemetry);
                     }
                 }
             },
@@ -3663,6 +3684,48 @@ impl SiphonApp {
                 self.config.bt.enable_upnp = v;
                 return self.save_config_async();
             }
+            Message::BtToggleIpv6DualStack(enable_ipv6) => {
+                self.config.bt.ipv4_only = !enable_ipv6;
+                if let Some(shared) = SHARED.get() {
+                    let bt_engine = Arc::clone(&shared.bt_engine);
+                    let bt_cfg = self.config.bt.clone();
+                    let out_dir = self.config.default_save_dir.clone();
+                    let proxy = self.config.proxy_url.clone();
+                    let save_task = self.save_config_async();
+                    let warm_task = Task::perform(
+                        async move {
+                            bt_engine.warmup(&bt_cfg, &out_dir, proxy.as_deref()).await;
+                        },
+                        |_| Message::BtCheckPort,
+                    );
+                    return Task::batch([save_task, warm_task]);
+                }
+                return self.save_config_async();
+            }
+            Message::BtSetEncryptionMode(mode) => {
+                self.config.bt.encryption_mode = mode;
+                let label = match mode {
+                    siphon_core::BtEncryptionMode::PreferEncrypted => "MSE/PE 优先加密（推荐）",
+                    siphon_core::BtEncryptionMode::ForceEncrypted => "MSE/PE 强制加密",
+                    siphon_core::BtEncryptionMode::Disabled => "关闭协议加密（明文）",
+                };
+                self.toast = Some(format!("已切换 BT 协议加密模式：{label}"));
+                if let Some(shared) = SHARED.get() {
+                    let bt_engine = Arc::clone(&shared.bt_engine);
+                    let bt_cfg = self.config.bt.clone();
+                    let out_dir = self.config.default_save_dir.clone();
+                    let proxy = self.config.proxy_url.clone();
+                    let save_task = self.save_config_async();
+                    let warm_task = Task::perform(
+                        async move {
+                            bt_engine.warmup(&bt_cfg, &out_dir, proxy.as_deref()).await;
+                        },
+                        |_| Message::BtCheckPort,
+                    );
+                    return Task::batch([save_task, warm_task]);
+                }
+                return self.save_config_async();
+            }
             Message::BtToggleDisableTrackers(v) => {
                 self.config.bt.disable_trackers = v;
                 return self.save_config_async();
@@ -3683,6 +3746,9 @@ impl SiphonApp {
             }
             Message::BtConnectTimeoutChanged(v) => {
                 self.bt_timeout_input = v;
+            }
+            Message::BtRwTimeoutChanged(v) => {
+                self.bt_rw_timeout_input = v;
             }
             Message::BtNewTrackerChanged(v) => {
                 self.bt_new_tracker_input = v;
@@ -3833,11 +3899,19 @@ impl SiphonApp {
                     .bt_timeout_input
                     .trim()
                     .parse::<u64>()
-                    .unwrap_or(10)
+                    .unwrap_or(12)
                     .clamp(3, 60);
+                self.config.bt.peer_read_write_timeout_secs = self
+                    .bt_rw_timeout_input
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(60)
+                    .clamp(15, 180);
                 self.bt_listen_port_input = self.config.bt.listen_port.to_string();
                 self.bt_max_peers_input = self.config.bt.max_peers_per_torrent.to_string();
                 self.bt_timeout_input = self.config.bt.peer_connect_timeout_secs.to_string();
+                self.bt_rw_timeout_input =
+                    self.config.bt.peer_read_write_timeout_secs.to_string();
                 self.toast = Some("BitTorrent 与自定义 Tracker 设置已保存".to_string());
                 if let Some(shared) = SHARED.get() {
                     let bt_engine = Arc::clone(&shared.bt_engine);
@@ -3849,11 +3923,42 @@ impl SiphonApp {
                         async move {
                             bt_engine.warmup(&bt_cfg, &out_dir, proxy.as_deref()).await;
                         },
-                        |_| Message::ClearToast,
+                        |_| Message::BtCheckPort,
                     );
                     return Task::batch([save_task, warm_task]);
                 }
                 return self.save_config_async();
+            }
+            Message::BtSessionStatusUpdated(snap) => {
+                self.bt_session_status = snap;
+            }
+            Message::BtCheckPort => {
+                if self.bt_checking_port {
+                    return Task::none();
+                }
+                if let Some(shared) = SHARED.get() {
+                    self.bt_checking_port = true;
+                    let bt_engine = Arc::clone(&shared.bt_engine);
+                    let bt_cfg = self.config.bt.clone();
+                    let out_dir = self.config.default_save_dir.clone();
+                    let proxy = self.config.proxy_url.clone();
+                    return Task::perform(
+                        async move {
+                            bt_engine
+                                .check_port_status(&bt_cfg, &out_dir, proxy.as_deref())
+                                .await
+                        },
+                        Message::BtPortCheckFinished,
+                    );
+                }
+            }
+            Message::BtPortCheckFinished(report) => {
+                self.bt_checking_port = false;
+                self.bt_port_report = Some(report);
+            }
+            Message::CopyTextToClipboard(val) => {
+                write_clipboard_text(&val);
+                self.toast = Some("已复制到剪贴板".to_string());
             }
 
             // eD2k dedicated workspace
@@ -4815,6 +4920,7 @@ impl SiphonApp {
             InputTarget::BtListenPort => &self.bt_listen_port_input,
             InputTarget::BtMaxPeers => &self.bt_max_peers_input,
             InputTarget::BtConnectTimeout => &self.bt_timeout_input,
+            InputTarget::BtRwTimeout => &self.bt_rw_timeout_input,
             InputTarget::BtNewTracker => &self.bt_new_tracker_input,
             InputTarget::BtNewSubscribeUrl => &self.bt_new_sub_url_input,
             InputTarget::Ed2kNickname => &self.config.ed2k.nickname,
@@ -4914,6 +5020,7 @@ impl SiphonApp {
             InputTarget::BtListenPort => self.bt_listen_port_input = val,
             InputTarget::BtMaxPeers => self.bt_max_peers_input = val,
             InputTarget::BtConnectTimeout => self.bt_timeout_input = val,
+            InputTarget::BtRwTimeout => self.bt_rw_timeout_input = val,
             InputTarget::BtNewTracker => self.bt_new_tracker_input = val,
             InputTarget::BtNewSubscribeUrl => self.bt_new_sub_url_input = val,
             InputTarget::Ed2kNickname => self.config.ed2k.nickname = val,
@@ -5401,6 +5508,9 @@ impl SiphonApp {
             &self.tasks,
             self.global_speed_bps,
             self.active_count,
+            &self.bt_session_status,
+            self.bt_port_report.as_ref(),
+            self.bt_checking_port,
             palette,
             strings,
         );
@@ -5408,9 +5518,13 @@ impl SiphonApp {
         let center_and_inspector: Element<'_, Message> = match self.active_nav {
             NavSection::BitTorrent => views::bt_view::view(
                 &self.config.bt,
+                &self.bt_session_status,
+                self.bt_port_report.as_ref(),
+                self.bt_checking_port,
                 &self.bt_listen_port_input,
                 &self.bt_max_peers_input,
                 &self.bt_timeout_input,
+                &self.bt_rw_timeout_input,
                 &self.bt_new_tracker_input,
                 &self.bt_new_sub_url_input,
                 self.bt_syncing_trackers,
@@ -5534,6 +5648,9 @@ impl SiphonApp {
                             sys_icon,
                             self.show_replace_url,
                             &self.replace_url_input,
+                            &self.bt_session_status,
+                            self.bt_port_report.as_ref(),
+                            self.bt_checking_port,
                             palette,
                             strings,
                         ),
@@ -5668,7 +5785,11 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
         );
 
         // Pre-warm shared BitTorrent session + persisted DHT routing table in the background so
-        // subsequent Magnet / .torrent tasks join swarms in milliseconds instead of cold-booting.
+        // subsequent Magnet / .torrent tasks join swarms in milliseconds instead of cold-booting,
+        // and immediately run an automatic silent port reachability probe once ready.
+        let bt_engine_stream = Arc::clone(&shared.bt_engine);
+        let (bt_port_init_tx, bt_port_init_rx) = tokio::sync::oneshot::channel();
+        let mut bt_port_init_rx = Some(bt_port_init_rx);
         let bt_warm = Arc::clone(&shared.bt_engine);
         tokio::spawn(async move {
             bt_warm
@@ -5678,10 +5799,19 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
                     init_cfg.proxy_url.as_deref(),
                 )
                 .await;
+            let report = bt_warm
+                .check_port_status(
+                    &init_cfg.bt,
+                    &init_cfg.default_save_dir,
+                    init_cfg.proxy_url.as_deref(),
+                )
+                .await;
+            let _ = bt_port_init_tx.send(report);
         });
 
-        // Start 500ms global speed ticker and 10s scheduler ticker inside Iced's Tokio runtime
+        // Start 500ms global speed ticker, 1s live BT status ticker, and 10s scheduler ticker
         let mut speed_ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+        let mut bt_status_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut sched_ticker = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
@@ -5702,6 +5832,17 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
                 }
                 Some(ipc_cmd) = ipc_rx.recv() => {
                     let _ = output.send(Message::IpcEvent(ipc_cmd)).await;
+                }
+                res = async {
+                    match bt_port_init_rx.as_mut() {
+                        Some(rx) => rx.await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    bt_port_init_rx = None;
+                    if let Some(report) = res {
+                        let _ = output.send(Message::BtPortCheckFinished(report)).await;
+                    }
                 }
                 Some(tray_act) = async {
                     match tray_rx.as_mut() {
@@ -5749,6 +5890,11 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
                         total_speed_bps,
                         active_count,
                     })).await;
+                }
+                _ = bt_status_ticker.tick() => {
+                    let cfg = mgr.config().await;
+                    let snap = bt_engine_stream.live_session_status(&cfg.bt).await;
+                    let _ = output.send(Message::BtSessionStatusUpdated(snap)).await;
                 }
                 _ = sched_ticker.tick() => {
                     let _ = output.send(Message::SchedulerTick).await;
