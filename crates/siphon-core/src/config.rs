@@ -1,4 +1,5 @@
 use crate::error::{Result, SiphonError};
+use crate::rss::RssConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -163,6 +164,15 @@ pub enum BtEncryptionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BtConfig {
+    /// Master switch for the BitTorrent / Magnet download engine.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Continue seeding completed BitTorrent tasks to the Swarm until stopped or target share ratio is reached.
+    #[serde(default = "default_true")]
+    pub seed_after_complete: bool,
+    /// Stop seeding automatically once `uploaded / downloaded >= max_seed_ratio` (`0.0` = unlimited / manual stop).
+    #[serde(default)]
+    pub max_seed_ratio: f64,
     /// Enable BitTorrent DHT network for trackerless peer discovery.
     pub enable_dht: bool,
     /// Enable Local Service Discovery (LSD) on LAN.
@@ -207,6 +217,9 @@ fn default_bt_rw_timeout_secs() -> u64 {
 impl Default for BtConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            seed_after_complete: true,
+            max_seed_ratio: 0.0,
             enable_dht: true,
             enable_lsd: true,
             enable_upnp: true,
@@ -379,6 +392,7 @@ pub struct AppConfig {
     pub schedule: ScheduleConfig,
     pub bt: BtConfig,
     pub ed2k: Ed2kConfig,
+    pub rss: RssConfig,
 }
 
 impl Default for AppConfig {
@@ -413,6 +427,7 @@ impl Default for AppConfig {
             schedule: ScheduleConfig::default(),
             bt: BtConfig::default(),
             ed2k: Ed2kConfig::default(),
+            rss: RssConfig::default(),
         }
     }
 }
@@ -605,6 +620,12 @@ mod tests {
     fn bt_and_ed2k_configs_roundtrip_via_toml() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = AppConfig::default();
+        assert!(cfg.bt.enabled);
+        assert!(cfg.bt.seed_after_complete);
+        assert_eq!(cfg.bt.max_seed_ratio, 0.0);
+        cfg.bt.enabled = false;
+        cfg.bt.seed_after_complete = false;
+        cfg.bt.max_seed_ratio = 2.0;
         cfg.bt.listen_port = 51413;
         cfg.bt.custom_trackers = vec!["udp://custom.tracker:80/announce".into()];
         cfg.bt.synced_trackers = vec![
@@ -620,9 +641,24 @@ mod tests {
             port: 4661,
             enabled: true,
         });
+        cfg.rss.default_refresh_interval_mins = 30;
+        cfg.rss.feeds.push(crate::RssFeed {
+            name: "Anime RSS".into(),
+            url: "https://example.com/rss.xml".into(),
+            auto_download: true,
+            include_filter: "1080p 简日".into(),
+            ..Default::default()
+        });
 
         cfg.save(tmp.path()).unwrap();
         let loaded = AppConfig::load_or_default(tmp.path()).unwrap();
+        assert_eq!(loaded.rss.default_refresh_interval_mins, 30);
+        assert_eq!(loaded.rss.feeds.len(), 1);
+        assert!(loaded.rss.feeds[0].auto_download);
+        assert_eq!(loaded.rss.feeds[0].include_filter, "1080p 简日");
+        assert!(!loaded.bt.enabled);
+        assert!(!loaded.bt.seed_after_complete);
+        assert!((loaded.bt.max_seed_ratio - 2.0).abs() < 1e-6);
         assert_eq!(loaded.bt.listen_port, 51413);
         assert_eq!(
             loaded.bt.effective_trackers(),

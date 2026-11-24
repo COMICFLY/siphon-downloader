@@ -1,6 +1,6 @@
 const SIPHON_ENDPOINT = "http://127.0.0.1:16800";
 const NATIVE_HOST_NAME = "com.siphon.downloader";
-const CLIENT_VERSION = "chrome-extension/0.8.0";
+const CLIENT_VERSION = "chrome-extension/0.9.0";
 
 const CAPTURE_EXT_RE = /\.(zip|7z|rar|tar|gz|bz2|xz|tgz|zst|iso|img|vhd|vhdx|dmg|ipsw|exe|msi|msix|appx|deb|rpm|apk|mp4|mkv|webm|mov|avi|flv|f4v|ts|m4s|m4v|m3u8|mpd|mp3|flac|wav|aac|ogg|m4a|opus|pdf|epub|doc|docx|xls|xlsx|ppt|pptx|torrent|bin|pak|safetensors|gguf)(\?|$)/i;
 const M3U8_URL_RE = /\.(m3u8|m3u)(\?|$|&)/i;

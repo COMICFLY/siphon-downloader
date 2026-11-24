@@ -104,11 +104,15 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Recover gracefully from an unexpected crash: active states become `Paused`.
+    /// Recover gracefully from an unexpected crash: active states become `Paused`, seeding becomes `Completed`.
     pub fn recover_interrupted_tasks(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("sqlite lock poisoned");
         let changed = conn.execute(
             "UPDATE tasks SET status = 'paused' WHERE status IN ('downloading', 'probing', 'verifying')",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE tasks SET status = 'completed' WHERE status = 'seeding'",
             [],
         )?;
         conn.execute(

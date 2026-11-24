@@ -3,8 +3,9 @@ use crate::icons::{IconKind, icon};
 use crate::state::{
     CaptureAction, CapturePopupState, ContextMenuState, DeleteConfirmState, DownloadPopupState,
     Ed2kSelectItem, ExtInstallModalState, InputTarget, Message, NavSection, NewTaskModalState,
-    P2pFileFilter, P2pSelectPopupState, P2pSelectTab, RuleDraft, ServerTestStatus, SniffEntry,
-    SniffFilterKind, SniffPopupState, TorrentSelectItem, UpdateCheckStatus,
+    P2pFileFilter, P2pSelectPopupState, P2pSelectTab, RssDraft, RuleDraft, ServerTestStatus,
+    SniffEntry, SniffFilterKind, SniffPopupState, TaskListFilterState, TorrentFilter,
+    TorrentSelectItem, TorrentSummary, UpdateCheckStatus, sort_tasks,
 };
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, SiphonPalette, hairline_rule_style, modal_card_style,
@@ -20,8 +21,9 @@ use iced::widget::{
 use iced::{Alignment, Element, Event, Length, Point, Size, Subscription, Task, Theme, stream, window};
 use siphon_core::{
     AppConfig, AutomationRule, ChecksumSpec, DownloadManager, DownloadTask, Ed2kServerEntry,
-    ExternalPlugin, FileCategory, HashAlgorithm, NewTaskRequest, QueueCompleteAction, RuleAction,
-    RuleCondition, RuleEngine, RuleEvalInput, TaskEvent, TaskId, TaskSource, TaskStatus, ThemeMode,
+    ExternalPlugin, FileCategory, HashAlgorithm, NewTaskRequest, ProtocolKind,
+    QueueCompleteAction, RssCache, RssFeed, RssItem, RssLinkKind, RuleAction, RuleCondition,
+    RuleEngine, RuleEvalInput, TaskEvent, TaskId, TaskSource, TaskStatus, ThemeMode,
     default_ed2k_servers, default_tracker_subscribe_urls, expand_batch_input, format_speed,
     infer_filename_from_raw_url, is_time_in_window, parse_hhmm, parse_tracker_list,
     sanitize_filename,
@@ -35,7 +37,9 @@ use siphon_engine_ed2k::{
     sync_servers_from_met, test_ed2k_server,
 };
 use siphon_engine_hls::HlsEngine;
-use siphon_engine_http::{HttpEngine, check_for_updates, probe_urls_sizes, sniff_webpage_url};
+use siphon_engine_http::{
+    HttpEngine, check_for_updates, fetch_rss_feed, probe_urls_sizes, sniff_webpage_url,
+};
 use siphon_platform_win::{
     BrowserCapturePayload, BrowserSniffPayload, DropEvent, FileIconKey, IpcCommand, TrayAction,
     TrayController, WinHookEvent, apply_win11_backdrop, deploy_browser_extension,
@@ -161,7 +165,10 @@ pub struct SiphonApp {
     pending_icons: HashSet<FileIconKey>,
 
     active_nav: NavSection,
+    task_filter: TaskListFilterState,
+    torrent_filter: TorrentFilter,
     selected_task_id: Option<TaskId>,
+    last_task_click: Option<(TaskId, std::time::Instant)>,
     quick_input: String,
     clipboard_banner_url: Option<String>,
     toast: Option<String>,
@@ -185,6 +192,15 @@ pub struct SiphonApp {
     p2p_popup: Option<P2pSelectPopupState>,
     download_popups: HashMap<window::Id, DownloadPopupState>,
     rule_draft: RuleDraft,
+
+    // RSS subscriptions & auto-download runtime state
+    rss_draft: RssDraft,
+    rss_selected_feed_id: Option<Uuid>,
+    rss_items_by_feed: HashMap<Uuid, Vec<RssItem>>,
+    rss_refreshing_feeds: HashSet<Uuid>,
+    rss_last_poll: HashMap<Uuid, std::time::Instant>,
+    rss_search: String,
+    rss_match_only: bool,
 
     // Scheduler runtime state
     sched_speed_kbps_input: String,
@@ -307,6 +323,8 @@ impl SiphonApp {
 
         let (main_id, open_main) = window::open(main_win_settings);
 
+        let rss_cache = RssCache::load_or_default(manager.data_dir());
+
         let mut app = Self {
             manager,
             tray: shared.tray_controller.clone(),
@@ -330,7 +348,10 @@ impl SiphonApp {
             file_icons: HashMap::new(),
             pending_icons: HashSet::new(),
             active_nav: NavSection::All,
+            task_filter: TaskListFilterState::default(),
+            torrent_filter: TorrentFilter::All,
             selected_task_id: None,
+            last_task_click: None,
             quick_input: String::new(),
             clipboard_banner_url: None,
             toast: None,
@@ -359,6 +380,13 @@ impl SiphonApp {
                 save_dir_template: r"{base}\{domain}".to_string(),
                 ..Default::default()
             },
+            rss_draft: RssDraft::default(),
+            rss_selected_feed_id: None,
+            rss_items_by_feed: rss_cache.items_by_feed,
+            rss_refreshing_feeds: HashSet::new(),
+            rss_last_poll: HashMap::new(),
+            rss_search: String::new(),
+            rss_match_only: false,
             sched_speed_kbps_input,
             sched_last_start_day: None,
             sched_last_stop_day: None,
@@ -371,7 +399,14 @@ impl SiphonApp {
             bt_new_sub_url_input: String::new(),
             bt_syncing_trackers: false,
             bt_sync_status: None,
-            bt_session_status: BtSessionStatusSnapshot::default(),
+            bt_session_status: BtSessionStatusSnapshot {
+                enabled: config.bt.enabled,
+                seed_after_complete: config.bt.seed_after_complete,
+                dual_stack: !config.bt.ipv4_only,
+                upnp_enabled: config.bt.enable_upnp,
+                encryption_mode: config.bt.encryption_mode,
+                ..Default::default()
+            },
             bt_port_report: None,
             bt_checking_port: false,
             ed2k_tcp_port_input,
@@ -451,6 +486,9 @@ impl SiphonApp {
         }
         if let Some(dp) = self.download_popups.get(&window_id) {
             if let Some(task) = self.tasks.iter().find(|t| t.id == dp.task_id) {
+                if task.status == TaskStatus::Seeding {
+                    return format!("[做种中] {} — Siphon", task.filename);
+                }
                 if task.status == TaskStatus::Completed {
                     return format!("[已完成] {} — Siphon", task.filename);
                 }
@@ -511,11 +549,56 @@ impl SiphonApp {
         }
     }
 
+    fn save_rss_cache_now(&self) {
+        let cache = RssCache {
+            items_by_feed: self.rss_items_by_feed.clone(),
+        };
+        let _ = cache.save(self.manager.data_dir());
+    }
+
+    fn trigger_rss_feed_refresh(&mut self, feed_id: Uuid) -> Task<Message> {
+        if self.rss_refreshing_feeds.contains(&feed_id) {
+            return Task::none();
+        }
+        let Some(feed) = self.config.rss.feeds.iter().find(|f| f.id == feed_id) else {
+            return Task::none();
+        };
+        let url = feed.url.clone();
+        self.rss_refreshing_feeds.insert(feed_id);
+        self.rss_last_poll.insert(feed_id, std::time::Instant::now());
+        let proxy = self.config.proxy_url.clone();
+        let ua = self.config.user_agent.clone();
+        Task::perform(
+            async move { fetch_rss_feed(&url, proxy.as_deref(), &ua).await },
+            move |res| Message::RssRefreshFinished(feed_id, res),
+        )
+    }
+
+    fn open_task_file_with_feedback(&mut self, id: TaskId) {
+        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if !t.status.is_finished() {
+            self.toast = Some(format!("「{}」尚未下载完成，完成后可双击打开", t.filename));
+            return;
+        }
+        let target = t.target_path();
+        if target.exists() {
+            if !open_file(&target) {
+                self.toast = Some(format!("无法打开文件：{}", t.filename));
+            }
+        } else if t.protocol == ProtocolKind::BitTorrent && t.save_dir.is_dir() {
+            open_folder(&t.save_dir);
+        } else {
+            self.toast = Some(format!("文件不存在或已被移动：{}", target.display()));
+        }
+    }
+
     fn task_icon_key(task: &DownloadTask) -> FileIconKey {
         FileIconKey::for_task(
             &task.filename,
             &task.target_path(),
-            task.status == TaskStatus::Completed,
+            task.status.is_finished(),
         )
     }
 
@@ -935,6 +1018,14 @@ impl SiphonApp {
         tab: P2pSelectTab,
         initial_input: Option<String>,
     ) -> Task<Message> {
+        if tab == P2pSelectTab::Torrent && !self.config.bt.enabled {
+            self.toast = Some("BitTorrent 引擎当前已关闭，请先在「BT / Tracker」页开启开关".to_string());
+            return Task::none();
+        }
+        if tab == P2pSelectTab::Ed2k && !self.config.ed2k.enabled {
+            self.toast = Some("eD2k 协议当前已关闭，请先在「eD2k 电驴」页开启开关".to_string());
+            return Task::none();
+        }
         self.modal.open = false;
         let trimmed_input = initial_input
             .map(|s| s.trim().to_string())
@@ -1373,6 +1464,8 @@ impl SiphonApp {
                     self.active_input = InputTarget::QuickBar;
                 } else if self.rule_draft.editing_id.is_some() {
                     return self.update(Message::RuleEditCancel);
+                } else if self.rss_draft.editing_id.is_some() {
+                    return self.update(Message::RssEditCancel);
                 } else if self.selected_task_id.is_some() {
                     self.selected_task_id = None;
                 }
@@ -1488,12 +1581,12 @@ impl SiphonApp {
                 }
                 TaskEvent::TaskUpdated(updated) => {
                     let icon_key = Self::task_icon_key(&updated);
-                    let became_completed = updated.status == TaskStatus::Completed
+                    let became_completed = updated.status.is_finished()
                         && self
                             .tasks
                             .iter()
                             .find(|t| t.id == updated.id)
-                            .is_none_or(|prev| prev.status != TaskStatus::Completed);
+                            .is_none_or(|prev| !prev.status.is_finished());
                     if let Some(slot) = self.tasks.iter_mut().find(|t| t.id == updated.id) {
                         let prev_hist = std::mem::take(&mut slot.speed_history);
                         let prev_bt_tel = slot.bt_telemetry.take();
@@ -2071,34 +2164,6 @@ impl SiphonApp {
             },
 
             // Standalone Browser Resource Sniff & Selective Download Window
-            Message::OpenEmptySniffPopup => {
-                if let Some(existing) = &self.sniff_popup {
-                    if let Some(hwnd) = existing.window_hwnd {
-                        show_window_native(hwnd);
-                    }
-                    if let Some(wid) = existing.window_id {
-                        self.active_input = InputTarget::SniffPageUrl;
-                        return Task::batch([
-                            window::gain_focus(wid),
-                            operation::focus(views::sniff_popup::sniff_page_url_id()),
-                        ]);
-                    }
-                }
-                let task = self.open_or_update_sniff_popup(BrowserSniffPayload {
-                    page_url: None,
-                    page_title: None,
-                    referrer: None,
-                    cookie: None,
-                    user_agent: None,
-                    bring_to_front: true,
-                    items: Vec::new(),
-                });
-                self.active_input = InputTarget::SniffPageUrl;
-                return Task::batch([
-                    task,
-                    operation::focus(views::sniff_popup::sniff_page_url_id()),
-                ]);
-            }
             Message::SniffWindowOpened(id) => {
                 if let Some(s) = &mut self.sniff_popup {
                     s.window_id = Some(id);
@@ -2442,9 +2507,6 @@ impl SiphonApp {
             }
 
             // Standalone BitTorrent (.torrent / Magnet) & eD2k Selective Download Window
-            Message::OpenP2pSelectPopup(tab, initial) => {
-                return self.open_or_update_p2p_popup(tab, initial);
-            }
             Message::P2pWindowOpened(id) => {
                 if let Some(p) = &mut self.p2p_popup {
                     p.window_id = Some(id);
@@ -3028,9 +3090,7 @@ impl SiphonApp {
             }
             Message::DownloadPopupOpenFile(win_id, task_id) => {
                 self.download_popups.remove(&win_id);
-                if let Some(t) = self.tasks.iter().find(|t| t.id == task_id) {
-                    open_file(&t.target_path());
-                }
+                self.open_task_file_with_feedback(task_id);
                 return window::close(win_id);
             }
             Message::DismissClipboardBanner => {
@@ -3055,6 +3115,105 @@ impl SiphonApp {
             Message::SelectNav(sec) => {
                 self.active_nav = sec;
             }
+            Message::SetTorrentFilter(f) => {
+                self.torrent_filter = f;
+            }
+            Message::SetTaskQuickFilter(f) => {
+                self.task_filter.quick_filter = f;
+            }
+            Message::SetTaskProtocolFilter(p) => {
+                self.task_filter.protocol_filter = p;
+            }
+            Message::SetTaskSortBy(by) => {
+                if self.task_filter.sort_by == by {
+                    self.task_filter.sort_desc = !self.task_filter.sort_desc;
+                } else {
+                    self.task_filter.sort_by = by;
+                    self.task_filter.sort_desc = true;
+                }
+            }
+            Message::ToggleTaskSortOrder => {
+                self.task_filter.sort_desc = !self.task_filter.sort_desc;
+            }
+            Message::TogglePinDownloading(v) => {
+                self.task_filter.pin_downloading = v;
+            }
+            Message::ResetTaskFilters => {
+                self.task_filter.quick_filter = crate::state::TaskQuickFilter::All;
+                self.task_filter.protocol_filter = crate::state::TaskProtocolFilter::All;
+            }
+            Message::ResumeAllTorrents => {
+                let mgr = Arc::clone(&self.manager);
+                return Task::perform(
+                    async move {
+                        mgr.resume_all_torrents()
+                            .await
+                            .map(|n| {
+                                if n > 0 {
+                                    format!("已恢复 {n} 个种子任务的下载")
+                                } else {
+                                    "当前没有暂停或失败的种子下载任务".to_string()
+                                }
+                            })
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::BatchSeedingFinished,
+                );
+            }
+            Message::PauseAllTorrents => {
+                let mgr = Arc::clone(&self.manager);
+                return Task::perform(
+                    async move {
+                        let n = mgr.pause_all_torrents().await;
+                        Ok(if n > 0 {
+                            format!("已暂停 {n} 个正在下载/排队的种子任务")
+                        } else {
+                            "当前没有正在下载的种子任务".to_string()
+                        })
+                    },
+                    Message::BatchSeedingFinished,
+                );
+            }
+            Message::StartAllSeeding => {
+                let mgr = Arc::clone(&self.manager);
+                return Task::perform(
+                    async move {
+                        mgr.start_all_seeding()
+                            .await
+                            .map(|n| {
+                                if n > 0 {
+                                    format!("已启动 {n} 个已完成种子的做种任务")
+                                } else {
+                                    "没有可启动做种的已完成种子".to_string()
+                                }
+                            })
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::BatchSeedingFinished,
+                );
+            }
+            Message::StopAllSeeding => {
+                let mgr = Arc::clone(&self.manager);
+                return Task::perform(
+                    async move {
+                        let n = mgr.stop_all_seeding().await;
+                        Ok(if n > 0 {
+                            format!("已停止 {n} 个种子的做种")
+                        } else {
+                            "当前没有正在做种的任务".to_string()
+                        })
+                    },
+                    Message::BatchSeedingFinished,
+                );
+            }
+            Message::BatchSeedingFinished(res) => match res {
+                Ok(msg) => {
+                    self.toast = Some(msg);
+                }
+                Err(e) => {
+                    self.toast = Some(e);
+                }
+            },
             Message::QuickBarChanged(val) => {
                 self.quick_input = val;
             }
@@ -3098,9 +3257,20 @@ impl SiphonApp {
 
             // Task controls
             Message::SelectTask(id) => {
+                let now = std::time::Instant::now();
+                let is_double_click = self.last_task_click.is_some_and(|(prev_id, prev_at)| {
+                    prev_id == id
+                        && now.duration_since(prev_at) <= std::time::Duration::from_millis(450)
+                });
                 self.selected_task_id = Some(id);
                 self.show_replace_url = false;
                 self.replace_url_input.clear();
+                if is_double_click {
+                    self.last_task_click = None;
+                    self.open_task_file_with_feedback(id);
+                } else {
+                    self.last_task_click = Some((id, now));
+                }
             }
             Message::CloseInspector => {
                 self.selected_task_id = None;
@@ -3142,7 +3312,7 @@ impl SiphonApp {
             Message::RequestDeleteTask(id) => {
                 if self.config.confirm_on_delete {
                     if let Some(t) = self.tasks.iter().find(|t| t.id == id) {
-                        let file_path = if t.status == TaskStatus::Completed {
+                        let file_path = if t.status.is_finished() {
                             t.target_path()
                         } else if t.part_path().exists() {
                             t.part_path()
@@ -3200,9 +3370,7 @@ impl SiphonApp {
                 );
             }
             Message::OpenTaskFile(id) => {
-                if let Some(t) = self.tasks.iter().find(|t| t.id == id) {
-                    open_file(&t.target_path());
-                }
+                self.open_task_file_with_feedback(id);
             }
             Message::RevealTaskInExplorer(id) => {
                 if let Some(t) = self.tasks.iter().find(|t| t.id == id) {
@@ -3368,6 +3536,12 @@ impl SiphonApp {
                 let url = self.modal.url.trim().to_string();
                 if url.is_empty() {
                     return Task::none();
+                }
+                if auto_start && is_bittorrent_url(&url) {
+                    return self.open_or_update_p2p_popup(P2pSelectTab::Torrent, Some(url));
+                }
+                if auto_start && is_ed2k_file_link(&url) {
+                    return self.open_or_update_p2p_popup(P2pSelectTab::Ed2k, Some(url));
                 }
                 let filename = {
                     let f = self.modal.filename.trim();
@@ -3666,12 +3840,103 @@ impl SiphonApp {
                     ));
                 }
 
+                // Periodic RSS subscription auto-refresh check
+                if self.config.rss.enabled && !self.config.rss.feeds.is_empty() {
+                    let now_inst = std::time::Instant::now();
+                    let default_mins = self.config.rss.default_refresh_interval_mins;
+                    let due_ids: Vec<Uuid> = self
+                        .config
+                        .rss
+                        .feeds
+                        .iter()
+                        .filter(|f| f.enabled && !self.rss_refreshing_feeds.contains(&f.id))
+                        .filter(|f| {
+                            let interval = std::time::Duration::from_secs(
+                                f.effective_interval_mins(default_mins) as u64 * 60,
+                            );
+                            self.rss_last_poll
+                                .get(&f.id)
+                                .is_none_or(|last| now_inst.duration_since(*last) >= interval)
+                        })
+                        .map(|f| f.id)
+                        .collect();
+                    for fid in due_ids {
+                        tasks_to_run.push(self.trigger_rss_feed_refresh(fid));
+                    }
+                }
+
                 if !tasks_to_run.is_empty() {
                     return Task::batch(tasks_to_run);
                 }
             }
 
             // BitTorrent & Custom Tracker dedicated workspace
+            Message::BtToggleEnabled(v) => {
+                self.config.bt.enabled = v;
+                self.bt_session_status.enabled = v;
+                let save_task = self.save_config_async();
+                if !v {
+                    self.bt_session_status.session_ready = false;
+                    self.bt_session_status.seeding_torrents = 0;
+                    self.bt_session_status.live_peers = 0;
+                    self.bt_session_status.upload_speed_bps = 0;
+                    self.bt_session_status.download_speed_bps = 0;
+                    self.bt_port_report = None;
+                    self.bt_checking_port = false;
+                    self.toast = Some("已关闭 BitTorrent / 磁力下载引擎".to_string());
+                    if let Some(shared) = SHARED.get() {
+                        let mgr = Arc::clone(&self.manager);
+                        let bt_engine = Arc::clone(&shared.bt_engine);
+                        let bt_cfg = self.config.bt.clone();
+                        let stop_task = Task::perform(
+                            async move {
+                                let _ = mgr.stop_all_seeding().await;
+                                bt_engine.stop_session().await;
+                                bt_engine.live_session_status(&bt_cfg).await
+                            },
+                            Message::BtSessionStatusUpdated,
+                        );
+                        return Task::batch([save_task, stop_task]);
+                    }
+                    return save_task;
+                } else {
+                    self.toast = Some("已启用 BitTorrent / 磁力下载引擎".to_string());
+                    if let Some(shared) = SHARED.get() {
+                        let bt_engine = Arc::clone(&shared.bt_engine);
+                        let bt_cfg = self.config.bt.clone();
+                        let out_dir = self.config.default_save_dir.clone();
+                        let proxy = self.config.proxy_url.clone();
+                        let warm_task = Task::perform(
+                            async move {
+                                bt_engine.warmup(&bt_cfg, &out_dir, proxy.as_deref()).await;
+                            },
+                            |_| Message::BtCheckPort,
+                        );
+                        return Task::batch([save_task, warm_task]);
+                    }
+                    return save_task;
+                }
+            }
+            Message::BtToggleSeedAfterComplete(v) => {
+                self.config.bt.seed_after_complete = v;
+                self.bt_session_status.seed_after_complete = v;
+                self.toast = Some(if v {
+                    "已开启下载完成后自动保持做种".to_string()
+                } else {
+                    "已关闭下载完成后自动做种".to_string()
+                });
+                return self.save_config_async();
+            }
+            Message::BtSetMaxSeedRatio(ratio) => {
+                let clamped = if ratio <= 0.0 { 0.0 } else { ratio };
+                self.config.bt.max_seed_ratio = clamped;
+                self.toast = Some(if clamped <= 0.0 {
+                    "做种分享率上限已设为不限".to_string()
+                } else {
+                    format!("做种分享率上限已设为 {clamped:.1}")
+                });
+                return self.save_config_async();
+            }
             Message::BtToggleDht(v) => {
                 self.config.bt.enable_dht = v;
                 return self.save_config_async();
@@ -3686,7 +3951,9 @@ impl SiphonApp {
             }
             Message::BtToggleIpv6DualStack(enable_ipv6) => {
                 self.config.bt.ipv4_only = !enable_ipv6;
-                if let Some(shared) = SHARED.get() {
+                if self.config.bt.enabled
+                    && let Some(shared) = SHARED.get()
+                {
                     let bt_engine = Arc::clone(&shared.bt_engine);
                     let bt_cfg = self.config.bt.clone();
                     let out_dir = self.config.default_save_dir.clone();
@@ -3710,7 +3977,9 @@ impl SiphonApp {
                     siphon_core::BtEncryptionMode::Disabled => "关闭协议加密（明文）",
                 };
                 self.toast = Some(format!("已切换 BT 协议加密模式：{label}"));
-                if let Some(shared) = SHARED.get() {
+                if self.config.bt.enabled
+                    && let Some(shared) = SHARED.get()
+                {
                     let bt_engine = Arc::clone(&shared.bt_engine);
                     let bt_cfg = self.config.bt.clone();
                     let out_dir = self.config.default_save_dir.clone();
@@ -3913,7 +4182,9 @@ impl SiphonApp {
                 self.bt_rw_timeout_input =
                     self.config.bt.peer_read_write_timeout_secs.to_string();
                 self.toast = Some("BitTorrent 与自定义 Tracker 设置已保存".to_string());
-                if let Some(shared) = SHARED.get() {
+                if self.config.bt.enabled
+                    && let Some(shared) = SHARED.get()
+                {
                     let bt_engine = Arc::clone(&shared.bt_engine);
                     let bt_cfg = self.config.bt.clone();
                     let out_dir = self.config.default_save_dir.clone();
@@ -3933,7 +4204,7 @@ impl SiphonApp {
                 self.bt_session_status = snap;
             }
             Message::BtCheckPort => {
-                if self.bt_checking_port {
+                if self.bt_checking_port || !self.config.bt.enabled {
                     return Task::none();
                 }
                 if let Some(shared) = SHARED.get() {
@@ -4419,6 +4690,411 @@ impl SiphonApp {
             }
             Message::RulesLoaded(rules) => {
                 self.rules = rules;
+            }
+
+            // RSS subscriptions & auto-download workspace
+            Message::RssToggleGlobalEnabled(v) => {
+                self.config.rss.enabled = v;
+                self.toast = Some(if v {
+                    "已启用 RSS 后台定时刷新".to_string()
+                } else {
+                    "已暂停 RSS 后台定时刷新".to_string()
+                });
+                return self.save_config_async();
+            }
+            Message::RssSetDefaultInterval(mins) => {
+                self.config.rss.default_refresh_interval_mins = mins.clamp(5, 1440);
+                return self.save_config_async();
+            }
+            Message::RssDraftUrl(v) => self.rss_draft.url = v,
+            Message::RssDraftName(v) => self.rss_draft.name = v,
+            Message::RssDraftInclude(v) => self.rss_draft.include_filter = v,
+            Message::RssDraftExclude(v) => self.rss_draft.exclude_filter = v,
+            Message::RssDraftSaveDir(v) => self.rss_draft.save_dir = v,
+            Message::RssDraftBrowseDir => {
+                let start = if !self.rss_draft.save_dir.trim().is_empty() {
+                    PathBuf::from(self.rss_draft.save_dir.trim())
+                } else {
+                    self.config.default_save_dir.clone()
+                };
+                return Task::perform(
+                    async move {
+                        let mut dlg = rfd::AsyncFileDialog::new();
+                        if start.is_dir() {
+                            dlg = dlg.set_directory(start);
+                        }
+                        dlg.pick_folder().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::RssDraftDirPicked,
+                );
+            }
+            Message::RssDraftDirPicked(Some(dir)) => {
+                self.rss_draft.save_dir = dir.to_string_lossy().to_string();
+            }
+            Message::RssDraftDirPicked(None) => {}
+            Message::RssDraftToggleAutoDownload(v) => self.rss_draft.auto_download = v,
+            Message::RssDraftSetInterval(mins) => self.rss_draft.refresh_interval_mins = mins,
+            Message::RssEditStart(id) => {
+                if let Some(feed) = self.config.rss.feeds.iter().find(|f| f.id == id) {
+                    self.rss_draft = RssDraft {
+                        editing_id: Some(feed.id),
+                        url: feed.url.clone(),
+                        name: feed.name.clone(),
+                        include_filter: feed.include_filter.clone(),
+                        exclude_filter: feed.exclude_filter.clone(),
+                        save_dir: feed
+                            .save_dir
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        auto_download: feed.auto_download,
+                        refresh_interval_mins: feed.refresh_interval_mins,
+                    };
+                    self.active_input = InputTarget::RssUrl;
+                    return operation::focus(views::rss_view::rss_url_input_id());
+                }
+            }
+            Message::RssEditCancel => {
+                self.rss_draft = RssDraft::default();
+            }
+            Message::RssDraftSubmit => {
+                let url = self.rss_draft.url.trim().to_string();
+                let low = url.to_ascii_lowercase();
+                if !(low.starts_with("http://") || low.starts_with("https://")) {
+                    self.toast = Some("请输入有效的 http:// 或 https:// RSS 订阅地址".to_string());
+                    return Task::none();
+                }
+                let save_dir = {
+                    let s = self.rss_draft.save_dir.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(s))
+                    }
+                };
+
+                if let Some(edit_id) = self.rss_draft.editing_id {
+                    if let Some(feed) = self.config.rss.feeds.iter_mut().find(|f| f.id == edit_id) {
+                        feed.url = url;
+                        feed.name = self.rss_draft.name.trim().to_string();
+                        feed.include_filter = self.rss_draft.include_filter.trim().to_string();
+                        feed.exclude_filter = self.rss_draft.exclude_filter.trim().to_string();
+                        feed.save_dir = save_dir;
+                        feed.auto_download = self.rss_draft.auto_download;
+                        feed.refresh_interval_mins = self.rss_draft.refresh_interval_mins;
+                        feed.last_error = None;
+                    }
+                    self.rss_draft = RssDraft::default();
+                    self.toast = Some("RSS 订阅设置已更新".to_string());
+                    let save = self.save_config_async();
+                    let refresh = self.trigger_rss_feed_refresh(edit_id);
+                    return Task::batch([save, refresh]);
+                } else {
+                    let new_feed = RssFeed {
+                        id: Uuid::new_v4(),
+                        name: self.rss_draft.name.trim().to_string(),
+                        url,
+                        enabled: true,
+                        auto_download: self.rss_draft.auto_download,
+                        include_filter: self.rss_draft.include_filter.trim().to_string(),
+                        exclude_filter: self.rss_draft.exclude_filter.trim().to_string(),
+                        save_dir,
+                        refresh_interval_mins: self.rss_draft.refresh_interval_mins,
+                        last_refreshed_at: None,
+                        last_error: None,
+                        downloaded_ids: Vec::new(),
+                    };
+                    let new_id = new_feed.id;
+                    self.config.rss.feeds.insert(0, new_feed);
+                    self.rss_selected_feed_id = Some(new_id);
+                    self.rss_draft = RssDraft::default();
+                    self.toast = Some("已添加 RSS 订阅源，正在拉取最新条目...".to_string());
+                    let save = self.save_config_async();
+                    let refresh = self.trigger_rss_feed_refresh(new_id);
+                    return Task::batch([save, refresh]);
+                }
+            }
+            Message::RssSelectFeed(id) => {
+                self.rss_selected_feed_id = id;
+            }
+            Message::RssToggleFeedEnabled(id, enabled) => {
+                if let Some(feed) = self.config.rss.feeds.iter_mut().find(|f| f.id == id) {
+                    feed.enabled = enabled;
+                }
+                return self.save_config_async();
+            }
+            Message::RssToggleFeedAutoDownload(id, auto_dl) => {
+                if let Some(feed) = self.config.rss.feeds.iter_mut().find(|f| f.id == id) {
+                    feed.auto_download = auto_dl;
+                    self.toast = Some(if auto_dl {
+                        format!("已为「{}」开启自动追更下载", feed.display_name())
+                    } else {
+                        format!("已关闭「{}」的自动追更下载", feed.display_name())
+                    });
+                }
+                return self.save_config_async();
+            }
+            Message::RssDeleteFeed(id) => {
+                self.config.rss.feeds.retain(|f| f.id != id);
+                self.rss_items_by_feed.remove(&id);
+                self.rss_refreshing_feeds.remove(&id);
+                self.rss_last_poll.remove(&id);
+                if self.rss_selected_feed_id == Some(id) {
+                    self.rss_selected_feed_id = None;
+                }
+                if self.rss_draft.editing_id == Some(id) {
+                    self.rss_draft = RssDraft::default();
+                }
+                self.save_rss_cache_now();
+                self.toast = Some("已删除 RSS 订阅源".to_string());
+                return self.save_config_async();
+            }
+            Message::RssRefreshFeed(id) => {
+                return self.trigger_rss_feed_refresh(id);
+            }
+            Message::RssRefreshAll => {
+                let ids: Vec<Uuid> = self.config.rss.feeds.iter().map(|f| f.id).collect();
+                let mut tasks = Vec::new();
+                for id in ids {
+                    tasks.push(self.trigger_rss_feed_refresh(id));
+                }
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
+                }
+            }
+            Message::RssRefreshFinished(feed_id, res) => {
+                self.rss_refreshing_feeds.remove(&feed_id);
+                let now_ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+                let mut auto_requests: Vec<NewTaskRequest> = Vec::new();
+                let mut feed_display_name = String::new();
+
+                match res {
+                    Ok(fetched) => {
+                        let bt_enabled = self.config.bt.enabled;
+                        let ed2k_enabled = self.config.ed2k.enabled;
+                        if let Some(feed) =
+                            self.config.rss.feeds.iter_mut().find(|f| f.id == feed_id)
+                        {
+                            if feed.name.trim().is_empty()
+                                && let Some(title) = fetched.feed_title
+                                && !title.trim().is_empty()
+                            {
+                                feed.name = title.trim().to_string();
+                            }
+                            feed.last_refreshed_at = Some(now_ts);
+                            feed.last_error = None;
+                            feed_display_name = feed.display_name().to_string();
+
+                            if feed.enabled && feed.auto_download {
+                                for item in &fetched.items {
+                                    if feed.has_downloaded(&item.guid)
+                                        || !feed.matches_title(&item.title)
+                                    {
+                                        continue;
+                                    }
+                                    let proto_allowed = match item.kind {
+                                        RssLinkKind::Magnet | RssLinkKind::Torrent => bt_enabled,
+                                        RssLinkKind::Ed2k => ed2k_enabled,
+                                        RssLinkKind::Http => true,
+                                    };
+                                    if !proto_allowed {
+                                        continue;
+                                    }
+                                    feed.mark_downloaded(item.guid.clone());
+                                    auto_requests.push(NewTaskRequest {
+                                        url: item.download_url.clone(),
+                                        filename: None,
+                                        save_dir: feed.save_dir.clone(),
+                                        max_connections: None,
+                                        speed_limit_bps: None,
+                                        headers: BTreeMap::new(),
+                                        checksum: None,
+                                        selected_files: None,
+                                        source: TaskSource::Rss,
+                                        auto_start: true,
+                                    });
+                                }
+                            }
+                        }
+
+                        self.rss_items_by_feed.insert(feed_id, fetched.items);
+                        self.save_rss_cache_now();
+
+                        if !auto_requests.is_empty() {
+                            let count = auto_requests.len();
+                            self.toast = Some(format!(
+                                "RSS「{feed_display_name}」自动捕获并开始下载 {count} 个新资源"
+                            ));
+                            let save = self.save_config_async();
+                            let mgr = Arc::clone(&self.manager);
+                            let enqueue = Task::perform(
+                                async move {
+                                    let mut last_err = None;
+                                    for req in auto_requests {
+                                        if let Err(e) = mgr.add_task(req).await {
+                                            last_err = Some(e.to_string());
+                                        }
+                                    }
+                                    match last_err {
+                                        Some(e) => Err(e),
+                                        None => Ok(()),
+                                    }
+                                },
+                                Message::TaskOpFinished,
+                            );
+                            return Task::batch([save, enqueue]);
+                        }
+                        return self.save_config_async();
+                    }
+                    Err(err) => {
+                        if let Some(feed) =
+                            self.config.rss.feeds.iter_mut().find(|f| f.id == feed_id)
+                        {
+                            feed.last_error = Some(err.clone());
+                            feed_display_name = feed.display_name().to_string();
+                        }
+                        self.toast = Some(format!("刷新 RSS「{feed_display_name}」失败：{err}"));
+                        return self.save_config_async();
+                    }
+                }
+            }
+            Message::RssSearchChanged(v) => {
+                self.rss_search = v;
+            }
+            Message::RssToggleMatchOnly(v) => {
+                self.rss_match_only = v;
+            }
+            Message::RssDownloadItem(feed_id, guid) => {
+                let Some(item) = self
+                    .rss_items_by_feed
+                    .get(&feed_id)
+                    .and_then(|list| list.iter().find(|i| i.guid == guid))
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                if matches!(item.kind, RssLinkKind::Magnet | RssLinkKind::Torrent)
+                    && !self.config.bt.enabled
+                {
+                    self.toast = Some(
+                        "BitTorrent 引擎当前已关闭，请先在「BT / Tracker」页开启开关".to_string(),
+                    );
+                    return Task::none();
+                }
+                if item.kind == RssLinkKind::Ed2k && !self.config.ed2k.enabled {
+                    self.toast =
+                        Some("eD2k 协议当前已关闭，请先在「eD2k 电驴」页开启开关".to_string());
+                    return Task::none();
+                }
+                let mut save_dir = None;
+                if let Some(feed) = self.config.rss.feeds.iter_mut().find(|f| f.id == feed_id) {
+                    feed.mark_downloaded(item.guid.clone());
+                    save_dir = feed.save_dir.clone();
+                }
+                self.toast = Some(format!("已从 RSS 开始下载：{}", item.title));
+                let req = NewTaskRequest {
+                    url: item.download_url,
+                    filename: None,
+                    save_dir,
+                    max_connections: None,
+                    speed_limit_bps: None,
+                    headers: BTreeMap::new(),
+                    checksum: None,
+                    selected_files: None,
+                    source: TaskSource::Rss,
+                    auto_start: true,
+                };
+                let save = self.save_config_async();
+                let mgr = Arc::clone(&self.manager);
+                let add = Task::perform(
+                    async move { mgr.add_task(req).await.map(|_| ()).map_err(|e| e.to_string()) },
+                    Message::TaskOpFinished,
+                );
+                return Task::batch([save, add]);
+            }
+            Message::RssDownloadAllMatching(target_feed_id) => {
+                let bt_enabled = self.config.bt.enabled;
+                let ed2k_enabled = self.config.ed2k.enabled;
+                let mut reqs = Vec::new();
+                for feed in &mut self.config.rss.feeds {
+                    if target_feed_id.is_some_and(|tid| tid != feed.id) {
+                        continue;
+                    }
+                    if let Some(items) = self.rss_items_by_feed.get(&feed.id) {
+                        for item in items {
+                            if feed.has_downloaded(&item.guid) || !feed.matches_title(&item.title) {
+                                continue;
+                            }
+                            let proto_ok = match item.kind {
+                                RssLinkKind::Magnet | RssLinkKind::Torrent => bt_enabled,
+                                RssLinkKind::Ed2k => ed2k_enabled,
+                                RssLinkKind::Http => true,
+                            };
+                            if !proto_ok {
+                                continue;
+                            }
+                            feed.mark_downloaded(item.guid.clone());
+                            reqs.push(NewTaskRequest {
+                                url: item.download_url.clone(),
+                                filename: None,
+                                save_dir: feed.save_dir.clone(),
+                                max_connections: None,
+                                speed_limit_bps: None,
+                                headers: BTreeMap::new(),
+                                checksum: None,
+                                selected_files: None,
+                                source: TaskSource::Rss,
+                                auto_start: true,
+                            });
+                        }
+                    }
+                }
+                if reqs.is_empty() {
+                    self.toast = Some("没有待下载的匹配 RSS 条目".to_string());
+                    return Task::none();
+                }
+                let count = reqs.len();
+                self.toast = Some(format!("已批量提交 {count} 个 RSS 匹配下载任务"));
+                let save = self.save_config_async();
+                let mgr = Arc::clone(&self.manager);
+                let enqueue = Task::perform(
+                    async move {
+                        let mut last_err = None;
+                        for req in reqs {
+                            if let Err(e) = mgr.add_task(req).await {
+                                last_err = Some(e.to_string());
+                            }
+                        }
+                        match last_err {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        }
+                    },
+                    Message::TaskOpFinished,
+                );
+                return Task::batch([save, enqueue]);
+            }
+            Message::RssMarkAllRead(target_feed_id) => {
+                let mut marked = 0usize;
+                for feed in &mut self.config.rss.feeds {
+                    if target_feed_id.is_some_and(|tid| tid != feed.id) {
+                        continue;
+                    }
+                    if let Some(items) = self.rss_items_by_feed.get(&feed.id) {
+                        for item in items {
+                            if !feed.has_downloaded(&item.guid) {
+                                feed.mark_downloaded(item.guid.clone());
+                                marked += 1;
+                            }
+                        }
+                    }
+                }
+                self.toast = Some(if marked > 0 {
+                    format!("已将 {marked} 条 RSS 内容标为已读（后续自动追更将跳过）")
+                } else {
+                    "当前条目均已标记为已读".to_string()
+                });
+                return self.save_config_async();
             }
 
             // Plugins workspace
@@ -4978,6 +5654,12 @@ impl SiphonApp {
                 .as_ref()
                 .map(|p| p.save_dir.as_str())
                 .unwrap_or(""),
+            InputTarget::RssUrl => &self.rss_draft.url,
+            InputTarget::RssName => &self.rss_draft.name,
+            InputTarget::RssInclude => &self.rss_draft.include_filter,
+            InputTarget::RssExclude => &self.rss_draft.exclude_filter,
+            InputTarget::RssSaveDir => &self.rss_draft.save_dir,
+            InputTarget::RssSearch => &self.rss_search,
         }
     }
 
@@ -5083,6 +5765,12 @@ impl SiphonApp {
                     p.save_dir = val;
                 }
             }
+            InputTarget::RssUrl => self.rss_draft.url = val,
+            InputTarget::RssName => self.rss_draft.name = val,
+            InputTarget::RssInclude => self.rss_draft.include_filter = val,
+            InputTarget::RssExclude => self.rss_draft.exclude_filter = val,
+            InputTarget::RssSaveDir => self.rss_draft.save_dir = val,
+            InputTarget::RssSearch => self.rss_search = val,
         }
     }
 
@@ -5508,6 +6196,7 @@ impl SiphonApp {
             &self.tasks,
             self.global_speed_bps,
             self.active_count,
+            self.config.rss.feeds.len(),
             &self.bt_session_status,
             self.bt_port_report.as_ref(),
             self.bt_checking_port,
@@ -5546,6 +6235,17 @@ impl SiphonApp {
                 &self.ed2k_server_tests,
                 palette,
             ),
+            NavSection::Rss => views::rss_view::view(
+                &self.config.rss,
+                &self.rss_draft,
+                self.rss_selected_feed_id,
+                &self.rss_items_by_feed,
+                &self.rss_refreshing_feeds,
+                &self.rss_search,
+                self.rss_match_only,
+                self.toast.as_deref(),
+                palette,
+            ),
             NavSection::Scheduler => views::scheduler_view::view(
                 &self.config.schedule,
                 &self.sched_speed_kbps_input,
@@ -5567,6 +6267,7 @@ impl SiphonApp {
                 &self.accent_hex_input,
                 &self.popup_accent_hex_input,
                 self.browser_ext_connected,
+                self.manager.data_dir(),
                 palette,
             ),
             NavSection::About => {
@@ -5590,13 +6291,56 @@ impl SiphonApp {
                     && !query.starts_with("magnet:?")
                     && !query.starts_with("ed2k://");
 
-                let filtered: Vec<&DownloadTask> = self
+                let mut torrent_summary = TorrentSummary {
+                    bt_enabled: self.config.bt.enabled,
+                    seed_after_complete: self.config.bt.seed_after_complete,
+                    ..Default::default()
+                };
+                let mut sum_task_up_bps = 0u64;
+                for t in &self.tasks {
+                    if t.protocol == ProtocolKind::BitTorrent {
+                        torrent_summary.total += 1;
+                        if t.status.is_active() || t.status == TaskStatus::Queued {
+                            torrent_summary.active_or_queued += 1;
+                        }
+                        if matches!(t.status, TaskStatus::Paused | TaskStatus::Error) {
+                            torrent_summary.paused_or_error += 1;
+                        }
+                        if t.status == TaskStatus::Seeding {
+                            torrent_summary.seeding += 1;
+                        } else if t.status.is_active() {
+                            torrent_summary.downloading += 1;
+                        } else {
+                            torrent_summary.stopped += 1;
+                            if t.status == TaskStatus::Completed {
+                                torrent_summary.completed_idle += 1;
+                            }
+                        }
+                        if let Some(tel) = &t.bt_telemetry {
+                            if t.status == TaskStatus::Seeding || t.status.is_active() {
+                                sum_task_up_bps = sum_task_up_bps.saturating_add(tel.upload_speed_bps);
+                            }
+                            torrent_summary.total_uploaded_bytes = torrent_summary
+                                .total_uploaded_bytes
+                                .saturating_add(tel.uploaded_bytes);
+                        }
+                    }
+                }
+                torrent_summary.total_upload_bps = sum_task_up_bps.max(
+                    if self.config.bt.enabled {
+                        self.bt_session_status.upload_speed_bps
+                    } else {
+                        0
+                    },
+                );
+
+                let nav_matched: Vec<&DownloadTask> = self
                     .tasks
                     .iter()
                     .filter(|t| match nav {
                         NavSection::All => true,
                         NavSection::Downloading => t.status.is_active(),
-                        NavSection::Completed => t.status == TaskStatus::Completed,
+                        NavSection::Completed => t.status.is_finished(),
                         NavSection::Paused => matches!(
                             t.status,
                             TaskStatus::Paused
@@ -5604,8 +6348,28 @@ impl SiphonApp {
                                 | TaskStatus::Error
                                 | TaskStatus::LinkExpired
                         ),
+                        NavSection::Torrents => t.protocol == ProtocolKind::BitTorrent,
                         NavSection::Category(cat) => t.category == cat,
                         _ => true,
+                    })
+                    .collect();
+                let unfiltered_nav_count = nav_matched.len();
+
+                let mut filtered: Vec<&DownloadTask> = nav_matched
+                    .into_iter()
+                    .filter(|t| match nav {
+                        NavSection::Torrents => match self.torrent_filter {
+                            TorrentFilter::All => true,
+                            TorrentFilter::Seeding => t.status == TaskStatus::Seeding,
+                            TorrentFilter::Downloading => t.status.is_active(),
+                            TorrentFilter::Stopped => {
+                                !t.status.is_active() && t.status != TaskStatus::Seeding
+                            }
+                        },
+                        NavSection::All | NavSection::Category(_) => {
+                            self.task_filter.quick_filter.matches(t.status)
+                        }
+                        _ => self.task_filter.protocol_filter.matches(&t.protocol),
                     })
                     .filter(|t| {
                         if !filter_text {
@@ -5617,11 +6381,17 @@ impl SiphonApp {
                     })
                     .collect();
 
+                sort_tasks(&mut filtered, self.task_filter);
+
                 let list_pane = views::task_list::view(
                     nav,
                     &filtered,
+                    unfiltered_nav_count,
                     self.selected_task_id,
                     self.config.list_density,
+                    self.task_filter,
+                    self.torrent_filter,
+                    torrent_summary,
                     &self.file_icons,
                     self.clipboard_banner_url.as_deref(),
                     self.toast.as_deref(),
@@ -5789,25 +6559,31 @@ fn runtime_event_stream() -> impl iced::futures::Stream<Item = Message> {
         // and immediately run an automatic silent port reachability probe once ready.
         let bt_engine_stream = Arc::clone(&shared.bt_engine);
         let (bt_port_init_tx, bt_port_init_rx) = tokio::sync::oneshot::channel();
-        let mut bt_port_init_rx = Some(bt_port_init_rx);
-        let bt_warm = Arc::clone(&shared.bt_engine);
-        tokio::spawn(async move {
-            bt_warm
-                .warmup(
-                    &init_cfg.bt,
-                    &init_cfg.default_save_dir,
-                    init_cfg.proxy_url.as_deref(),
-                )
-                .await;
-            let report = bt_warm
-                .check_port_status(
-                    &init_cfg.bt,
-                    &init_cfg.default_save_dir,
-                    init_cfg.proxy_url.as_deref(),
-                )
-                .await;
-            let _ = bt_port_init_tx.send(report);
-        });
+        let mut bt_port_init_rx = if init_cfg.bt.enabled {
+            Some(bt_port_init_rx)
+        } else {
+            None
+        };
+        if init_cfg.bt.enabled {
+            let bt_warm = Arc::clone(&shared.bt_engine);
+            tokio::spawn(async move {
+                bt_warm
+                    .warmup(
+                        &init_cfg.bt,
+                        &init_cfg.default_save_dir,
+                        init_cfg.proxy_url.as_deref(),
+                    )
+                    .await;
+                let report = bt_warm
+                    .check_port_status(
+                        &init_cfg.bt,
+                        &init_cfg.default_save_dir,
+                        init_cfg.proxy_url.as_deref(),
+                    )
+                    .await;
+                let _ = bt_port_init_tx.send(report);
+            });
+        }
 
         // Start 500ms global speed ticker, 1s live BT status ticker, and 10s scheduler ticker
         let mut speed_ticker = tokio::time::interval(std::time::Duration::from_millis(500));

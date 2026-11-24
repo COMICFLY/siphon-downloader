@@ -22,6 +22,9 @@ pub enum EngineUpdate {
         segments: Vec<SegmentInfo>,
     },
     BtTelemetry(BtLiveTelemetry),
+    Seeding {
+        total_bytes: u64,
+    },
     Verifying,
     Log(TaskLogEntry),
 }

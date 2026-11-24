@@ -2,8 +2,8 @@ use crate::config::AppConfig;
 use crate::error::{Result, SiphonError};
 use crate::limiter::{HierarchicalLimiter, TokenBucket};
 use crate::model::{
-    DownloadTask, FileCategory, NewTaskRequest, ProbePreview, SegmentState, TaskEvent, TaskId,
-    TaskSource, TaskStatus,
+    DownloadTask, FileCategory, NewTaskRequest, ProbePreview, ProtocolKind, SegmentState,
+    TaskEvent, TaskId, TaskSource, TaskStatus,
 };
 use crate::plugin::{PluginRegistry, PostDownloadInput, ResolveInput};
 use crate::protocol::{DownloadContext, EngineUpdate, ProtocolHandler};
@@ -463,12 +463,30 @@ impl DownloadManager {
             let task = tasks
                 .get_mut(&id)
                 .ok_or_else(|| SiphonError::TaskNotFound(id.to_string()))?;
-            if task.status == TaskStatus::Completed || task.status.is_active() {
+            if task.status.is_active()
+                || task.status == TaskStatus::Seeding
+                || (task.status == TaskStatus::Completed
+                    && task.protocol != ProtocolKind::BitTorrent)
+            {
                 return Ok(());
+            }
+            let restarting_seed =
+                task.status == TaskStatus::Completed && task.protocol == ProtocolKind::BitTorrent;
+            if restarting_seed && !self.config.read().await.bt.enabled {
+                return Err(SiphonError::Config(
+                    "BitTorrent 引擎当前已关闭，请先在「BT / Tracker」页开启开关".to_string(),
+                ));
             }
             task.status = TaskStatus::Queued;
             task.error_message = None;
-            task.push_log("INFO", "已加入下载队列");
+            task.push_log(
+                "INFO",
+                if restarting_seed {
+                    "已加入队列（校验后继续做种）"
+                } else {
+                    "已加入下载队列"
+                },
+            );
             self.store.upsert_task(task)?;
             let _ = self.events_tx.send(TaskEvent::TaskUpdated(task.clone()));
         }
@@ -485,16 +503,40 @@ impl DownloadManager {
             if let Some(task) = tasks.get_mut(&id)
                 && task.status != TaskStatus::Completed
             {
-                task.status = TaskStatus::Paused;
+                let was_seeding = task.status == TaskStatus::Seeding;
+                task.status = if was_seeding {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::Paused
+                };
                 task.speed_bps = 0;
-                task.eta_secs = None;
-                for seg in &mut task.segments {
-                    if matches!(seg.state, SegmentState::Active | SegmentState::Retrying) {
-                        seg.state = SegmentState::Pending;
-                        seg.speed_bps = 0;
+                task.eta_secs = if was_seeding { Some(0) } else { None };
+                if !was_seeding {
+                    for seg in &mut task.segments {
+                        if matches!(seg.state, SegmentState::Active | SegmentState::Retrying) {
+                            seg.state = SegmentState::Pending;
+                            seg.speed_bps = 0;
+                        }
                     }
                 }
-                task.push_log("INFO", "任务已暂停");
+                if let Some(tel) = &mut task.bt_telemetry {
+                    tel.is_seeding = false;
+                    tel.upload_speed_bps = 0;
+                    tel.live_peers = 0;
+                    tel.phase = if was_seeding {
+                        "已完成".to_string()
+                    } else {
+                        "已暂停".to_string()
+                    };
+                }
+                task.push_log(
+                    "INFO",
+                    if was_seeding {
+                        "已手动停止做种"
+                    } else {
+                        "任务已暂停"
+                    },
+                );
                 self.store.upsert_task(task)?;
                 let _ = self.events_tx.send(TaskEvent::TaskUpdated(task.clone()));
             }
@@ -531,6 +573,102 @@ impl DownloadManager {
         }
     }
 
+    /// Pause all active or queued BitTorrent download tasks (leaving active seeders untouched).
+    pub async fn pause_all_torrents(self: &Arc<Self>) -> usize {
+        let ids: Vec<TaskId> = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .values()
+                .filter(|t| {
+                    t.protocol == ProtocolKind::BitTorrent
+                        && (t.status.is_active() || t.status == TaskStatus::Queued)
+                })
+                .map(|t| t.id)
+                .collect()
+        };
+        let mut paused = 0usize;
+        for id in ids {
+            if self.pause_task(id).await.is_ok() {
+                paused += 1;
+            }
+        }
+        paused
+    }
+
+    /// Resume all paused or errored BitTorrent download tasks.
+    pub async fn resume_all_torrents(self: &Arc<Self>) -> Result<usize> {
+        if !self.config.read().await.bt.enabled {
+            return Err(SiphonError::Config(
+                "BitTorrent 引擎当前已关闭，请先开启引擎开关".to_string(),
+            ));
+        }
+        let ids: Vec<TaskId> = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .values()
+                .filter(|t| {
+                    t.protocol == ProtocolKind::BitTorrent
+                        && matches!(t.status, TaskStatus::Paused | TaskStatus::Error)
+                })
+                .map(|t| t.id)
+                .collect()
+        };
+        let mut resumed = 0usize;
+        for id in ids {
+            if self.start_task(id).await.is_ok() {
+                resumed += 1;
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Start seeding all completed BitTorrent tasks that are currently stopped.
+    pub async fn start_all_seeding(self: &Arc<Self>) -> Result<usize> {
+        if !self.config.read().await.bt.enabled {
+            return Err(SiphonError::Config(
+                "BitTorrent 引擎当前已关闭，请先开启引擎开关".to_string(),
+            ));
+        }
+        let ids: Vec<TaskId> = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .values()
+                .filter(|t| {
+                    t.protocol == ProtocolKind::BitTorrent && t.status == TaskStatus::Completed
+                })
+                .map(|t| t.id)
+                .collect()
+        };
+        let mut started = 0usize;
+        for id in ids {
+            if self.start_task(id).await.is_ok() {
+                started += 1;
+            }
+        }
+        Ok(started)
+    }
+
+    /// Stop seeding all currently seeding BitTorrent tasks (transitioning them to Completed).
+    pub async fn stop_all_seeding(self: &Arc<Self>) -> usize {
+        let ids: Vec<TaskId> = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .values()
+                .filter(|t| {
+                    t.protocol == ProtocolKind::BitTorrent && t.status == TaskStatus::Seeding
+                })
+                .map(|t| t.id)
+                .collect()
+        };
+        let mut stopped = 0usize;
+        for id in ids {
+            if self.pause_task(id).await.is_ok() {
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+
     pub async fn remove_task(self: &Arc<Self>, id: TaskId, delete_files: bool) -> Result<()> {
         let was_active = if let Some(handle) = self.active.write().await.remove(&id) {
             handle.cancel.cancel();
@@ -557,7 +695,7 @@ impl DownloadManager {
                     let _ = std::fs::remove_file(&part);
                 }
             }
-            if task.status == TaskStatus::Completed {
+            if task.status.is_finished() {
                 let target = task.target_path();
                 if target.exists() {
                     let _ = std::fs::remove_file(&target);
@@ -635,7 +773,10 @@ impl DownloadManager {
         Box::pin(async move {
             let max_concurrent = self.config.read().await.max_concurrent_tasks;
             loop {
-                let active_count = self.active.read().await.len();
+                let active_count = {
+                    let tasks = self.tasks.read().await;
+                    tasks.values().filter(|t| t.status.is_active()).count()
+                };
                 if active_count >= max_concurrent {
                     break;
                 }
@@ -692,6 +833,15 @@ impl DownloadManager {
             },
         );
 
+        let mut bt_config = cfg.bt.clone();
+        if task_snapshot.protocol == ProtocolKind::BitTorrent
+            && task_snapshot.completed_at.is_some()
+        {
+            // Explicit "start / resume seeding" on an already-completed torrent should seed
+            // even when global auto-seeding after download is disabled.
+            bt_config.seed_after_complete = true;
+        }
+
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
         let ctx = DownloadContext {
             task: task_snapshot.clone(),
@@ -702,7 +852,7 @@ impl DownloadManager {
             proxy_url: cfg.proxy_url.clone(),
             user_agent: cfg.user_agent.clone(),
             live_max_connections: live_connections,
-            bt_config: cfg.bt.clone(),
+            bt_config,
             ed2k_config: cfg.ed2k.clone(),
         };
 
@@ -784,6 +934,45 @@ impl DownloadManager {
                             task_id: id,
                             telemetry,
                         });
+                    }
+                    EngineUpdate::Seeding { total_bytes } => {
+                        let completed_event = {
+                            let mut tasks = mgr_updates.tasks.write().await;
+                            if let Some(t) = tasks.get_mut(&id) {
+                                let first_completion = t.completed_at.is_none();
+                                t.status = TaskStatus::Seeding;
+                                t.downloaded_bytes = total_bytes;
+                                if t.total_size.is_none() {
+                                    t.total_size = Some(total_bytes);
+                                }
+                                t.speed_bps = 0;
+                                t.eta_secs = Some(0);
+                                if first_completion {
+                                    t.completed_at = Some(Utc::now());
+                                }
+                                for seg in &mut t.segments {
+                                    seg.state = SegmentState::Done;
+                                    seg.speed_bps = 0;
+                                }
+                                let _ = mgr_updates.store.upsert_task(t);
+                                let _ = mgr_updates.events_tx.send(TaskEvent::TaskUpdated(t.clone()));
+                                if first_completion {
+                                    Some((t.filename.clone(), t.target_path()))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((filename, target_path)) = completed_event {
+                            let _ = mgr_updates.events_tx.send(TaskEvent::TaskCompleted {
+                                task_id: id,
+                                filename,
+                                target_path,
+                            });
+                        }
+                        mgr_updates.pump_queue().await;
                     }
                     EngineUpdate::Verifying => {
                         let mut tasks = mgr_updates.tasks.write().await;

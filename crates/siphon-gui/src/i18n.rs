@@ -54,11 +54,20 @@ impl Strings {
     pub fn paused_tasks(&self) -> &'static str {
         self.t("队列与暂停", "Paused")
     }
+    pub fn torrents_category(&self) -> &'static str {
+        self.t("种子 / 做种", "Torrents")
+    }
+    pub fn torrents_title(&self) -> &'static str {
+        self.t("种子与做种管理", "Torrents & Seeding")
+    }
     pub fn rules(&self) -> &'static str {
         self.t("规则引擎", "Rules")
     }
     pub fn scheduler(&self) -> &'static str {
         self.t("计划调度", "Scheduler")
+    }
+    pub fn rss(&self) -> &'static str {
+        self.t("RSS 订阅", "RSS Feeds")
     }
     pub fn plugins(&self) -> &'static str {
         self.t("插件扩展", "Plugins")
@@ -133,6 +142,7 @@ impl Strings {
             TaskStatus::Queued => self.t("排队中", "Queued"),
             TaskStatus::Probing => self.t("探测中", "Probing"),
             TaskStatus::Downloading => self.t("下载中", "Downloading"),
+            TaskStatus::Seeding => self.t("做种中", "Seeding"),
             TaskStatus::Paused => self.t("已暂停", "Paused"),
             TaskStatus::Verifying => self.t("校验中", "Verifying"),
             TaskStatus::Completed => self.t("已完成", "Completed"),

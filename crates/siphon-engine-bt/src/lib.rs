@@ -99,6 +99,9 @@ pub enum BtPortLight {
 /// Real-time snapshot of the shared BitTorrent session, DHT tables, and connection counters.
 #[derive(Debug, Clone, Default)]
 pub struct BtSessionStatusSnapshot {
+    pub enabled: bool,
+    pub seed_after_complete: bool,
+    pub seeding_torrents: usize,
     pub session_ready: bool,
     pub listen_addr: Option<String>,
     pub listen_port: u16,
@@ -191,13 +194,42 @@ impl BitTorrentEngine {
         }
     }
 
+    /// Gracefully stop the shared BitTorrent session and release listening ports.
+    pub async fn stop_session(&self) {
+        let mut guard = self.warm.lock().await;
+        if let Some(old) = guard.take() {
+            old.session.stop().await;
+        }
+        self.incoming_observed.store(false, Ordering::Relaxed);
+    }
+
     /// Non-blocking snapshot of the currently warm BitTorrent session for live UI telemetry.
     pub async fn live_session_status(&self, bt: &BtConfig) -> BtSessionStatusSnapshot {
         let incoming_observed = self.incoming_observed.load(Ordering::Relaxed);
         let detected_tun_adapter = detect_tun_adapter();
+        if !bt.enabled {
+            return BtSessionStatusSnapshot {
+                enabled: false,
+                seed_after_complete: bt.seed_after_complete,
+                seeding_torrents: 0,
+                session_ready: false,
+                listen_addr: None,
+                listen_port: bt.listen_port,
+                dual_stack: !bt.ipv4_only,
+                encryption_mode: bt.encryption_mode,
+                detected_tun_adapter,
+                upnp_enabled: bt.enable_upnp,
+                dht_enabled: bt.enable_dht,
+                incoming_observed: false,
+                ..Default::default()
+            };
+        }
         let guard = self.warm.lock().await;
         let Some(warm) = guard.as_ref() else {
             return BtSessionStatusSnapshot {
+                enabled: true,
+                seed_after_complete: bt.seed_after_complete,
+                seeding_torrents: 0,
                 session_ready: false,
                 listen_addr: None,
                 listen_port: bt.listen_port,
@@ -213,6 +245,9 @@ impl BitTorrentEngine {
 
         let sess = &warm.session;
         let snap = sess.stats_snapshot();
+        let seeding_torrents = sess.with_torrents(|iter| {
+            iter.filter(|(_, h)| h.stats().finished).count()
+        });
         let listen_addr = sess.listen_addr();
         let listen_port = sess
             .announce_port()
@@ -228,6 +263,9 @@ impl BitTorrentEngine {
             .unwrap_or((0, 0));
 
         BtSessionStatusSnapshot {
+            enabled: true,
+            seed_after_complete: bt.seed_after_complete,
+            seeding_torrents,
             session_ready: true,
             listen_addr: listen_addr.map(|a| a.to_string()),
             listen_port,
@@ -268,6 +306,28 @@ impl BitTorrentEngine {
         let checked_at = chrono::Local::now().format("%H:%M:%S").to_string();
         let incoming_observed = self.incoming_observed.load(Ordering::Relaxed);
         let detected_tun_adapter = detect_tun_adapter();
+
+        if !bt.enabled {
+            return BtPortCheckReport {
+                light: BtPortLight::Unknown,
+                checked_at,
+                listen_addr: "已关闭".to_string(),
+                listen_port: bt.listen_port,
+                dual_stack: !bt.ipv4_only,
+                encryption_mode: bt.encryption_mode,
+                detected_tun_adapter,
+                local_v4_ok: false,
+                local_v6_ok: None,
+                public_ipv4: None,
+                public_ipv6: None,
+                external_port_open: None,
+                incoming_observed: false,
+                dht_nodes_v4: 0,
+                dht_nodes_v6: 0,
+                summary: "BitTorrent / 磁力引擎已关闭".to_string(),
+                advice: "在下方开启「启用 BitTorrent / 磁力引擎」后将自动绑定监听端口并恢复连接检测。".to_string(),
+            };
+        }
 
         let session = match self
             .get_or_create_session(bt, fallback_dir, proxy_url)
@@ -361,7 +421,7 @@ impl BitTorrentEngine {
                     "检测到本机虚拟网卡（{tun}），当前协议加密已关闭，明文 BT 握手极易被 TUN/代理节点直接掐断！强烈建议开启「MSE/PE 优先加密」或将 Siphon 加入 TUN 绕过白名单。"
                 ),
                 BtEncryptionMode::PreferEncrypted | BtEncryptionMode::ForceEncrypted => format!(
-                    "检测到本机虚拟网卡（{tun}），已开启 MSE/PE 加密握手穿透明文拦截；如需绿灯入站或提升 DHT/uTP 性能，可将 siphon.exe 加入该 TUN 的直连/进程绕过规则。"
+                    "检测到本机虚拟网卡（{tun}），已开启 MSE/PE 加密握手穿透明文拦截；如需外部直连入站或提升 DHT/uTP 性能，可将 siphon.exe 加入该 TUN 的直连/进程绕过规则。"
                 ),
             };
             advice = format!("{tun_note} | {advice}");
@@ -391,6 +451,10 @@ impl BitTorrentEngine {
     /// Pre-warm the shared BitTorrent session & DHT routing table in the background at app startup
     /// so subsequent Magnet / `.torrent` downloads attach in milliseconds instead of cold-bootstrapping.
     pub async fn warmup(&self, bt: &BtConfig, default_output_dir: &Path, proxy_url: Option<&str>) {
+        if !bt.enabled {
+            self.stop_session().await;
+            return;
+        }
         if !bt.enable_dht && bt.disable_trackers {
             return;
         }
@@ -502,6 +566,9 @@ impl BitTorrentEngine {
         fallback_dir: &Path,
         proxy_url: Option<&str>,
     ) -> std::result::Result<TorrentInspectInfo, String> {
+        if !bt.enabled {
+            return Err("BitTorrent / 磁力引擎已在设置中关闭，请先在 BT 设置页开启".to_string());
+        }
         let trimmed = raw_input.trim().trim_matches('"');
         if trimmed.is_empty() {
             return Err("请输入磁力链接、种子直链或选择本地 .torrent 文件".to_string());
@@ -973,6 +1040,11 @@ impl ProtocolHandler for BitTorrentEngine {
     }
 
     async fn download(&self, ctx: DownloadContext) -> Result<DownloadOutcome> {
+        if !ctx.bt_config.enabled {
+            return Err(SiphonError::Network(
+                "BitTorrent / 磁力引擎已在设置中关闭，请先开启后再下载".into(),
+            ));
+        }
         let t0 = Instant::now();
         let output_dir = ctx.task.save_dir.clone();
         tokio::fs::create_dir_all(&output_dir).await?;
@@ -1093,6 +1165,7 @@ impl ProtocolHandler for BitTorrentEngine {
         );
 
         let mut metadata_emitted = false;
+        let mut seeding_notified = false;
         let mut last_peer_summary = (0u32, 0u32);
         let mut tick_idx = 0u64;
 
@@ -1236,7 +1309,10 @@ impl ProtocolHandler for BitTorrentEngine {
                     (0, 0, 0, 0, 0, 0, 0, stats.uploaded_bytes, 0)
                 };
 
-                let phase = if stats.finished {
+                let is_seeding = stats.finished && ctx.bt_config.seed_after_complete;
+                let phase = if is_seeding {
+                    "做种中"
+                } else if stats.finished {
                     "已完成"
                 } else if stats.total_bytes == 0 {
                     "拉取元数据"
@@ -1253,6 +1329,7 @@ impl ProtocolHandler for BitTorrentEngine {
                 let _ = ctx.updates_tx.send(EngineUpdate::BtTelemetry(BtLiveTelemetry {
                     info_hash: resolved_info_hash.clone(),
                     phase: phase.to_string(),
+                    is_seeding,
                     listen_addr: bound_addr_str.clone(),
                     listen_port: bound_port,
                     dual_stack: actual_dual_stack,
@@ -1278,24 +1355,26 @@ impl ProtocolHandler for BitTorrentEngine {
             }
             tick_idx = tick_idx.wrapping_add(1);
 
-            let segments = build_bt_segments(
-                stats.total_bytes,
-                stats.progress_bytes,
-                speed_bps,
-                stats.finished,
-            );
+            if !seeding_notified {
+                let segments = build_bt_segments(
+                    stats.total_bytes,
+                    stats.progress_bytes,
+                    speed_bps,
+                    stats.finished,
+                );
 
-            let _ = ctx.updates_tx.send(EngineUpdate::Progress {
-                downloaded_bytes: stats.progress_bytes,
-                total_size: if stats.total_bytes > 0 {
-                    Some(stats.total_bytes)
-                } else {
-                    None
-                },
-                speed_bps,
-                eta_secs,
-                segments,
-            });
+                let _ = ctx.updates_tx.send(EngineUpdate::Progress {
+                    downloaded_bytes: stats.progress_bytes,
+                    total_size: if stats.total_bytes > 0 {
+                        Some(stats.total_bytes)
+                    } else {
+                        None
+                    },
+                    speed_bps,
+                    eta_secs,
+                    segments,
+                });
+            }
 
             if let Some(err) = stats.error {
                 let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
@@ -1304,12 +1383,53 @@ impl ProtocolHandler for BitTorrentEngine {
 
             if stats.finished {
                 let total_bytes = stats.total_bytes.max(stats.progress_bytes);
-                push_log(&ctx, "info", "BitTorrent 全部数据校验并下载完成");
-                let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
-                return Ok(DownloadOutcome {
-                    total_bytes,
-                    verified_hash: None,
-                });
+                if !ctx.bt_config.seed_after_complete {
+                    push_log(&ctx, "info", "BitTorrent 全部数据校验并下载完成");
+                    let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
+                    return Ok(DownloadOutcome {
+                        total_bytes,
+                        verified_hash: None,
+                    });
+                }
+
+                if !seeding_notified {
+                    seeding_notified = true;
+                    let ratio_note = if ctx.bt_config.max_seed_ratio > 0.0 {
+                        format!("（目标分享率 {:.1}）", ctx.bt_config.max_seed_ratio)
+                    } else {
+                        "（持续做种直至手动停止）".to_string()
+                    };
+                    push_log(
+                        &ctx,
+                        "info",
+                        format!("BitTorrent 全部数据校验完成，已转入做种状态{ratio_note}"),
+                    );
+                    let _ = ctx.updates_tx.send(EngineUpdate::Seeding { total_bytes });
+                }
+
+                let uploaded_total = stats
+                    .live
+                    .as_ref()
+                    .map(|l| stats.uploaded_bytes.max(l.snapshot.uploaded_bytes))
+                    .unwrap_or(stats.uploaded_bytes);
+                if ctx.bt_config.max_seed_ratio > 0.0 && total_bytes > 0 {
+                    let ratio = uploaded_total as f64 / total_bytes as f64;
+                    if ratio >= ctx.bt_config.max_seed_ratio {
+                        push_log(
+                            &ctx,
+                            "info",
+                            format!(
+                                "分享率已达 {ratio:.2}（目标 {:.1}），自动停止做种",
+                                ctx.bt_config.max_seed_ratio
+                            ),
+                        );
+                        let _ = session.delete(TorrentIdOrHash::Id(torrent_id), false).await;
+                        return Ok(DownloadOutcome {
+                            total_bytes,
+                            verified_hash: None,
+                        });
+                    }
+                }
             }
 
             tokio::select! {
@@ -1510,7 +1630,7 @@ pub fn evaluate_port_light(
     if listen_port == 0 || !local_ok {
         return (
             BtPortLight::Red,
-            format!("红灯 · 本地端口 :{listen_port} 未响应监听"),
+            format!("本地端口 :{listen_port} 未响应监听"),
             "本地 BT 监听套接字未就绪，请检查端口占用或 Windows 防火墙拦截后重试".to_string(),
         );
     }
@@ -1525,7 +1645,7 @@ pub fn evaluate_port_light(
         };
         return (
             BtPortLight::Green,
-            format!("绿灯 · 端口 :{listen_port} 入站畅通"),
+            format!("端口 :{listen_port} 入站畅通"),
             format!("{via}，当前处于最佳 P2P 互联状态"),
         );
     }
@@ -1533,9 +1653,9 @@ pub fn evaluate_port_light(
     if dual_stack && local_v6_ok == Some(true) && (has_public_ipv6 || dht_nodes_v6 > 0) {
         return (
             BtPortLight::Green,
-            format!("绿灯 · IPv6 双栈可达 (:{listen_port})"),
+            format!("IPv6 双栈可达 (:{listen_port})"),
             if external_port_open == Some(false) {
-                "IPv4 处于 NAT/防火墙后，但检测到公网 IPv6 双栈可用，IPv6 Peer 可直连互通（如需 IPv4 也绿灯，请在路由器转发此端口）".to_string()
+                "IPv4 处于 NAT/防火墙后，但检测到公网 IPv6 双栈可用，IPv6 Peer 可直连互通（如需 IPv4 也能直接入站，请在路由器转发此端口）".to_string()
             } else {
                 "检测到公网 IPv6 双栈就绪，支持直连 IPv6 公网 Peer 与双栈 DHT".to_string()
             },
@@ -1543,12 +1663,12 @@ pub fn evaluate_port_light(
     }
 
     let summary = if external_port_open == Some(false) {
-        format!("黄灯 · 端口 :{listen_port} 外网入站阻塞（仅出站）")
+        format!("端口 :{listen_port} 外网入站阻塞（仅出站）")
     } else {
-        format!("黄灯 · 本地 :{listen_port} 监听正常，外网入站未确认")
+        format!("本地 :{listen_port} 监听正常，外网入站未确认")
     };
     let advice = format!(
-        "当前仅能主动外连公网 Peer（类似黄灯阻塞）。改善建议：1) 检查路由器是否开启 IPv6；2) 在路由器为 TCP/UDP 端口 {listen_port} 配置端口转发或开启 UPnP；3) 在 Windows 防火墙放行 Siphon 入站"
+        "当前仅能主动外连公网 Peer（入站受限）。改善建议：1) 检查路由器是否开启 IPv6；2) 在路由器为 TCP/UDP 端口 {listen_port} 配置端口转发或开启 UPnP；3) 在 Windows 防火墙放行 Siphon 入站"
     );
     (BtPortLight::Yellow, summary, advice)
 }
@@ -1842,9 +1962,22 @@ mod tests {
             .unwrap();
 
         let after = engine.live_session_status(&bt).await;
+        assert!(after.enabled);
         assert!(after.session_ready);
         assert!(after.listen_port > 0);
         assert!(local_loopback_port_probe(SocketAddr::from((Ipv4Addr::LOCALHOST, after.listen_port))).await);
+
+        // Stopping session when BT is disabled cleanly releases the session and updates snapshot
+        engine.stop_session().await;
+        let disabled_bt = BtConfig {
+            enabled: false,
+            ..bt
+        };
+        engine.warmup(&disabled_bt, dir.path(), None).await;
+        let stopped = engine.live_session_status(&disabled_bt).await;
+        assert!(!stopped.enabled);
+        assert!(!stopped.session_ready);
+        assert_eq!(stopped.seeding_torrents, 0);
     }
 
     #[tokio::test]

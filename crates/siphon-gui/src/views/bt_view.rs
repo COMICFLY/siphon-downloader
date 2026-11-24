@@ -1,5 +1,5 @@
 use crate::icons::{IconKind, icon};
-use crate::state::{InputTarget, Message, P2pSelectTab};
+use crate::state::{InputTarget, Message};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_MONO_BOLD, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette,
     clean_scrollable_style, danger_btn_style, hairline_rule_style, input_style, outline_btn_style,
@@ -46,7 +46,7 @@ pub fn view<'a>(
                 .size(22)
                 .font(FONT_SEMIBOLD)
                 .color(palette.text_primary),
-            text("配置 BT / 磁力网络参数、自定义 Tracker 列表以及公共 Tracker 订阅源一键同步")
+            text("管理 BT / 磁力引擎开关、做种状态与策略、实时端口诊断及 Tracker 订阅")
                 .size(14)
                 .font(FONT_REGULAR)
                 .color(palette.text_secondary),
@@ -54,83 +54,138 @@ pub fn view<'a>(
         .spacing(4),
         space::horizontal(),
         button(
-            row![
-                icon(IconKind::Magnet, 13.0, palette.accent),
-                text("种子文件选择窗").size(13).font(FONT_MEDIUM),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
+            text("保存 BT 设置")
+                .size(13)
+                .font(FONT_MEDIUM)
+                .wrapping(text::Wrapping::None),
         )
-        .padding([8, 14])
-        .style(outline_btn_style(palette))
-        .on_press(Message::OpenP2pSelectPopup(P2pSelectTab::Torrent, None)),
-        button(text("保存 BT 设置").size(13).font(FONT_MEDIUM))
-            .padding([8, 16])
-            .style(primary_btn_style(palette))
-            .on_press(Message::BtSave),
+        .padding([8, 16])
+        .style(primary_btn_style(palette))
+        .on_press(Message::BtSave),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
 
-    let stat_chip = |label: String, highlight: bool| {
+    let stat_chip = |label: String, fg: Color, bg: Color| {
         container(
             text(label)
                 .size(12)
                 .font(FONT_MONO)
-                .color(if highlight {
-                    palette.accent
-                } else {
-                    palette.text_secondary
-                }),
+                .wrapping(text::Wrapping::None)
+                .color(fg),
         )
         .padding([4, 10])
-        .style(panel_style(
-            if highlight {
-                palette.accent_soft
-            } else {
-                palette.bg_input
-            },
-            Some(palette.hairline),
-            6.0,
-        ))
+        .style(panel_style(bg, Some(palette.hairline), 6.0))
+    };
+
+    let status_headline = if !bt.enabled {
+        "BitTorrent 引擎当前已关闭".to_string()
+    } else if bt_status.seeding_torrents > 0 {
+        format!(
+            "BT 引擎运行中 · 正在做种 {} 个任务（↑ {}）",
+            bt_status.seeding_torrents,
+            format_speed(bt_status.upload_speed_bps)
+        )
+    } else if bt.auto_append_trackers && !bt.disable_trackers {
+        format!("BT 引擎运行中 · 生效 Tracker：{effective_count} 条")
+    } else if bt.disable_trackers {
+        "BT 引擎运行中 · 纯 DHT 模式（Tracker 已禁用）".to_string()
+    } else {
+        "BT 引擎运行中 · 自动注入自定义 Tracker 已关闭".to_string()
     };
 
     let status_bar = container(
         row![
-            icon(IconKind::Magnet, 16.0, palette.accent),
-            text(if bt.auto_append_trackers && !bt.disable_trackers {
-                format!("合并去重生效 Tracker：{effective_count} 条")
-            } else if bt.disable_trackers {
-                "纯 DHT 模式（Tracker 已禁用）".to_string()
-            } else {
-                "自动注入自定义 Tracker 已关闭".to_string()
-            })
-            .size(13)
-            .font(FONT_MEDIUM)
-            .color(palette.text_primary),
+            icon(
+                IconKind::Magnet,
+                16.0,
+                if !bt.enabled {
+                    palette.text_muted
+                } else if bt_status.seeding_torrents > 0 {
+                    palette.ok
+                } else {
+                    palette.accent
+                }
+            ),
+            text(status_headline)
+                .size(13)
+                .font(FONT_MEDIUM)
+                .color(if bt.enabled {
+                    palette.text_primary
+                } else {
+                    palette.text_secondary
+                }),
             space::horizontal(),
+            stat_chip(
+                if !bt.enabled {
+                    "引擎已关闭".to_string()
+                } else if bt_status.seeding_torrents > 0 {
+                    format!("做种中 {}", bt_status.seeding_torrents)
+                } else if bt.seed_after_complete {
+                    "自动做种 开".to_string()
+                } else {
+                    "自动做种 关".to_string()
+                },
+                if !bt.enabled {
+                    palette.text_muted
+                } else if bt_status.seeding_torrents > 0 || bt.seed_after_complete {
+                    palette.ok
+                } else {
+                    palette.text_secondary
+                },
+                if bt.enabled && (bt_status.seeding_torrents > 0 || bt.seed_after_complete) {
+                    palette.ok_soft
+                } else {
+                    palette.bg_input
+                },
+            ),
             stat_chip(
                 match bt.encryption_mode {
                     BtEncryptionMode::PreferEncrypted => "MSE 优先加密".to_string(),
                     BtEncryptionMode::ForceEncrypted => "MSE 强制加密".to_string(),
                     BtEncryptionMode::Disabled => "明文握手".to_string(),
                 },
-                bt.encryption_mode != BtEncryptionMode::Disabled,
+                if bt.enabled && bt.encryption_mode != BtEncryptionMode::Disabled {
+                    palette.accent
+                } else {
+                    palette.text_secondary
+                },
+                if bt.enabled && bt.encryption_mode != BtEncryptionMode::Disabled {
+                    palette.accent_soft
+                } else {
+                    palette.bg_input
+                },
             ),
             stat_chip(
                 if bt.ipv4_only {
                     "仅 IPv4".to_string()
                 } else {
-                    "IPv4+IPv6 双栈".to_string()
+                    "双栈".to_string()
                 },
-                !bt.ipv4_only,
+                if bt.enabled && !bt.ipv4_only {
+                    palette.accent
+                } else {
+                    palette.text_secondary
+                },
+                if bt.enabled && !bt.ipv4_only {
+                    palette.accent_soft
+                } else {
+                    palette.bg_input
+                },
             ),
             stat_chip(
                 format!("DHT {}", if bt.enable_dht { "开" } else { "关" }),
-                bt.enable_dht,
+                if bt.enabled && bt.enable_dht {
+                    palette.accent
+                } else {
+                    palette.text_secondary
+                },
+                if bt.enabled && bt.enable_dht {
+                    palette.accent_soft
+                } else {
+                    palette.bg_input
+                },
             ),
-            stat_chip(format!("自定义 {}", bt.custom_trackers.len()), false),
-            stat_chip(format!("订阅同步 {}", bt.synced_trackers.len()), false),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -139,7 +194,7 @@ pub fn view<'a>(
     .width(Length::Fill)
     .style(panel_style(palette.bg_card, Some(palette.hairline), 10.0));
 
-    // Card 0: Real-Time Connection Telemetry & Port Reachability Diagnostics
+    // Card 0: Real-Time Connection Telemetry, Seeding Status & Port Reachability Diagnostics
     let effective_light = match bt_port_report.map(|r| r.light) {
         Some(BtPortLight::Red) => BtPortLight::Red,
         Some(BtPortLight::Green) => BtPortLight::Green,
@@ -149,14 +204,16 @@ pub fn view<'a>(
         _ => BtPortLight::Unknown,
     };
 
-    let (light_color, light_bg, light_title) = if bt_checking_port {
-        (palette.accent, palette.accent_soft, "正在探测端口可达性...")
+    let (light_color, light_bg, light_title) = if !bt.enabled {
+        (palette.text_muted, palette.bg_input, "已关闭")
+    } else if bt_checking_port {
+        (palette.accent, palette.accent_soft, "正在探测端口...")
     } else {
         match effective_light {
-            BtPortLight::Green => (palette.ok, palette.ok_soft, "绿灯 · 入站畅通"),
-            BtPortLight::Yellow => (palette.warn, palette.warn_soft, "黄灯 · 仅出站受限"),
-            BtPortLight::Red => (palette.err, palette.err_soft, "红灯 · 监听异常"),
-            BtPortLight::Unknown => (palette.text_secondary, palette.bg_input, "未检测 · 点击测端口"),
+            BtPortLight::Green => (palette.ok, palette.ok_soft, "入站畅通"),
+            BtPortLight::Yellow => (palette.warn, palette.warn_soft, "仅出站受限"),
+            BtPortLight::Red => (palette.err, palette.err_soft, "监听异常"),
+            BtPortLight::Unknown => (palette.text_secondary, palette.bg_input, "待检测"),
         }
     };
 
@@ -165,7 +222,9 @@ pub fn view<'a>(
         .clone()
         .or_else(|| bt_port_report.map(|r| r.listen_addr.clone()))
         .unwrap_or_else(|| {
-            if bt_status.session_ready {
+            if !bt.enabled {
+                "未启动".to_string()
+            } else if bt_status.session_ready {
                 format!(":{}", bt_status.listen_port)
             } else {
                 "预热/未绑定".to_string()
@@ -203,18 +262,47 @@ pub fn view<'a>(
     let v6_ok = bt_status.tcp_v6_ok + bt_status.utp_v6_ok;
     let dht_total = bt_status.dht_nodes_v4 + bt_status.dht_nodes_v6;
 
+    let (seeding_main, seeding_color) = if !bt.enabled {
+        ("已关闭".to_string(), palette.text_muted)
+    } else if bt_status.seeding_torrents > 0 {
+        (format!("做种中 {} 个", bt_status.seeding_torrents), palette.ok)
+    } else if bt.seed_after_complete {
+        ("待机 · 自动做种".to_string(), palette.text_primary)
+    } else {
+        ("自动做种已关闭".to_string(), palette.text_secondary)
+    };
+    let seeding_sub = if !bt.enabled {
+        "开启引擎后可用".to_string()
+    } else {
+        let ratio_hint = if bt.max_seed_ratio > 0.0 {
+            format!("上限 {:.1}", bt.max_seed_ratio)
+        } else {
+            "分享率不限".to_string()
+        };
+        format!(
+            "↑ {} · {}",
+            format_speed(bt_status.upload_speed_bps),
+            ratio_hint
+        )
+    };
+
     let mut live_diag_col = column![
         row![
             column![
-                text("实时连接状态与端口可达性检测")
+                text("实时连接、做种与端口状态")
                     .size(14)
                     .font(FONT_SEMIBOLD)
                     .color(palette.text_primary),
-                text(format!(
-                    "实时监听地址：{bound_addr_label}  ·  ↓ {}  ↑ {}",
-                    format_speed(bt_status.download_speed_bps),
-                    format_speed(bt_status.upload_speed_bps),
-                ))
+                text(if !bt.enabled {
+                    "BitTorrent 引擎已关闭，开启下方总开关后自动监听端口并接入 DHT / Swarm".to_string()
+                } else {
+                    format!(
+                        "监听地址：{bound_addr_label}  ·  ↓ {}  ↑ {}  ·  做种中 {} 个",
+                        format_speed(bt_status.download_speed_bps),
+                        format_speed(bt_status.upload_speed_bps),
+                        bt_status.seeding_torrents,
+                    )
+                })
                 .size(12)
                 .font(FONT_MONO)
                 .color(palette.text_muted),
@@ -230,6 +318,7 @@ pub fn view<'a>(
                     text(light_title)
                         .size(12)
                         .font(FONT_MEDIUM)
+                        .wrapping(text::Wrapping::None)
                         .color(light_color),
                 ]
                 .spacing(6)
@@ -254,14 +343,15 @@ pub fn view<'a>(
             )
             .padding([6, 12])
             .style(primary_btn_style(palette))
-            .on_press_maybe((!bt_checking_port).then_some(Message::BtCheckPort)),
+            .on_press_maybe((bt.enabled && !bt_checking_port).then_some(Message::BtCheckPort)),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
         row![
+            metric_tile("做种状态", seeding_main, seeding_color, seeding_sub),
             metric_tile(
                 "全局活跃 Peer",
-                format!("{} 个（做种 {}）", bt_status.live_peers, bt_status.live_seeders),
+                format!("{} 个（远端做种 {}）", bt_status.live_peers, bt_status.live_seeders),
                 if bt_status.live_peers > 0 {
                     palette.accent
                 } else {
@@ -286,43 +376,47 @@ pub fn view<'a>(
                 ),
             ),
             metric_tile(
-                "入站连接观察",
-                if bt_status.incoming_observed {
+                "入站与出站握手",
+                if !bt.enabled {
+                    "引擎已关闭".to_string()
+                } else if bt_status.incoming_observed {
                     "已收到外部连入".to_string()
+                } else if outbound_ok > 0 {
+                    format!("出站成功 {outbound_ok}")
                 } else if bt_status.session_ready {
                     "监听运行中".to_string()
                 } else {
-                    "引擎预热中".to_string()
+                    "预热中".to_string()
                 },
-                if bt_status.incoming_observed {
-                    palette.ok
-                } else {
-                    palette.text_primary
-                },
-                format!(
-                    "{} · UPnP {}",
-                    if bt_status.dual_stack { "双栈 [::]" } else { "仅 IPv4" },
-                    if bt_status.upnp_enabled { "开" } else { "关" }
-                ),
-            ),
-            metric_tile(
-                "出站握手统计",
-                format!("成功 {outbound_ok} / 失败 {outbound_err}"),
-                if outbound_ok > 0 {
+                if !bt.enabled {
+                    palette.text_muted
+                } else if bt_status.incoming_observed || outbound_ok > 0 {
                     palette.ok
                 } else if outbound_err > 0 {
                     palette.warn
                 } else {
                     palette.text_primary
                 },
-                format!("v4成功 {v4_ok} · v6成功 {v6_ok}"),
+                format!("v4:{v4_ok} v6:{v6_ok} · 失败 {outbound_err}"),
             ),
         ]
         .spacing(10),
     ]
     .spacing(12);
 
-    if let Some(rep) = bt_port_report {
+    if !bt.enabled {
+        live_diag_col = live_diag_col.push(
+            container(
+                text("BitTorrent 引擎当前处于关闭状态，端口监听与 DHT 已释放；开启下方「启用 BitTorrent / 磁力下载引擎」开关即可恢复。")
+                    .size(12)
+                    .font(FONT_REGULAR)
+                    .color(palette.text_secondary),
+            )
+            .padding([9, 12])
+            .width(Length::Fill)
+            .style(panel_style(palette.bg_input, Some(palette.hairline), 8.0)),
+        );
+    } else if let Some(rep) = bt_port_report {
         let probe_badge = |label: &'static str, val: String, color: Color| {
             container(
                 row![
@@ -489,13 +583,68 @@ pub fn view<'a>(
     .spacing(12)
     .align_y(Alignment::Center);
 
-    // Card 1: BT Core Network Settings
+    let ratio_btn = |label: &'static str, ratio: f64| {
+        let active = (bt.max_seed_ratio - ratio).abs() < 0.05;
+        button(
+            text(label)
+                .size(12)
+                .font(if active { FONT_MEDIUM } else { FONT_REGULAR })
+                .wrapping(text::Wrapping::None),
+        )
+        .padding([5, 10])
+        .style(subtle_btn_style(palette, active))
+        .on_press(Message::BtSetMaxSeedRatio(ratio))
+    };
+
+    let seed_ratio_row = row![
+        column![
+            text("做种分享率上限")
+                .size(13)
+                .font(FONT_MEDIUM)
+                .color(palette.text_primary),
+            text("达到目标分享率（上传量 ÷ 下载量）后自动结束做种；设为「不限」则保持做种直至手动停止")
+                .size(12)
+                .font(FONT_REGULAR)
+                .color(palette.text_muted),
+        ]
+        .spacing(3)
+        .width(Length::Fill),
+        container(
+            row![
+                ratio_btn("不限", 0.0),
+                ratio_btn("1.0", 1.0),
+                ratio_btn("2.0", 2.0),
+                ratio_btn("3.0", 3.0),
+            ]
+            .spacing(2),
+        )
+        .padding(2)
+        .style(panel_style(palette.bg_input, Some(palette.hairline), 8.0)),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+
+    // Card 1: BT Engine Switches, Seeding Policy & Core Network Settings
     let network_card = container(
         column![
-            text("BitTorrent 协议与网络参数")
+            text("BT 引擎开关、做种策略与网络参数")
                 .size(14)
                 .font(FONT_SEMIBOLD)
                 .color(palette.text_primary),
+            toggle_row(
+                "启用 BitTorrent / 磁力下载引擎",
+                "关闭后立即停止 BT 监听端口与 DHT 节点，并不再接收新的磁力链接或 .torrent 任务",
+                bt.enabled,
+                Message::BtToggleEnabled,
+            ),
+            toggle_row(
+                "下载完成后自动保持做种",
+                "开启后，BT / 磁力任务下载至 100% 时自动转为「做种中」状态继续上传回馈 Swarm，且不占用下载并发配额",
+                bt.seed_after_complete,
+                Message::BtToggleSeedAfterComplete,
+            ),
+            seed_ratio_row,
+            rule::horizontal(1).style(hairline_rule_style(palette)),
             encryption_row,
             rule::horizontal(1).style(hairline_rule_style(palette)),
             toggle_row(

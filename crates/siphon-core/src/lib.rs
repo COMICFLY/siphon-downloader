@@ -6,6 +6,7 @@ pub mod manager;
 pub mod model;
 pub mod plugin;
 pub mod protocol;
+pub mod rss;
 pub mod rules;
 pub mod storage;
 
@@ -32,5 +33,6 @@ pub use plugin::{
     PostDownloadOutput, PostProcessor, ResolveInput, ResolveOutput,
 };
 pub use protocol::{DownloadContext, DownloadOutcome, EngineUpdate, ProtocolHandler};
+pub use rss::{RssCache, RssConfig, RssFeed, RssItem, RssLinkKind, matches_filter_expr};
 pub use rules::{AutomationRule, RuleAction, RuleCondition, RuleEngine, RuleEvalInput, RuleMatchResult};
 pub use storage::TaskStore;

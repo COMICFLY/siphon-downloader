@@ -1,11 +1,11 @@
 use iced::{Point, window};
 use siphon_core::{
     AppConfig, AutomationRule, BtEncryptionMode, DownloadTask, ExternalPlugin, FileCategory,
-    Language, ListDensity, ProbePreview, QueueCompleteAction, TaskEvent, TaskId, TaskSource,
-    ThemeMode,
+    Language, ListDensity, ProbePreview, ProtocolKind, QueueCompleteAction, TaskEvent, TaskId,
+    TaskSource, TaskStatus, ThemeMode,
 };
 use siphon_engine_bt::{BtPortCheckReport, BtSessionStatusSnapshot};
-use siphon_engine_http::{SniffedWebItem, UpdateInfo};
+use siphon_engine_http::{FetchedRssFeed, SniffedWebItem, UpdateInfo};
 use siphon_platform_win::{
     DetectedBrowser, DropEvent, FileIconBitmap, FileIconKey, IpcCommand, TrayAction, WinHookEvent,
 };
@@ -19,14 +19,199 @@ pub enum NavSection {
     Downloading,
     Completed,
     Paused,
+    Torrents,
     Category(FileCategory),
     BitTorrent,
     Ed2k,
+    Rss,
     Scheduler,
     Rules,
     Plugins,
     Settings,
     About,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TorrentFilter {
+    #[default]
+    All,
+    Seeding,
+    Downloading,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskQuickFilter {
+    #[default]
+    All,
+    Downloading,
+    Seeding,
+    Paused,
+    Completed,
+}
+
+impl TaskQuickFilter {
+    pub fn matches(self, status: TaskStatus) -> bool {
+        match self {
+            Self::All => true,
+            Self::Downloading => status.is_active(),
+            Self::Seeding => status == TaskStatus::Seeding,
+            Self::Paused => matches!(
+                status,
+                TaskStatus::Paused
+                    | TaskStatus::Queued
+                    | TaskStatus::Error
+                    | TaskStatus::LinkExpired
+            ),
+            Self::Completed => status == TaskStatus::Completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskProtocolFilter {
+    #[default]
+    All,
+    Http,
+    BitTorrent,
+    Hls,
+    Ed2k,
+}
+
+impl TaskProtocolFilter {
+    pub fn matches(self, protocol: &ProtocolKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Http => *protocol == ProtocolKind::Http,
+            Self::BitTorrent => *protocol == ProtocolKind::BitTorrent,
+            Self::Hls => *protocol == ProtocolKind::Hls,
+            Self::Ed2k => *protocol == ProtocolKind::Ed2k,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskSortBy {
+    /// Default: Progress (quantized to whole %) + Request/Created time.
+    #[default]
+    ProgressAndTime,
+    Progress,
+    CreatedAt,
+    Size,
+    Name,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskListFilterState {
+    pub quick_filter: TaskQuickFilter,
+    pub protocol_filter: TaskProtocolFilter,
+    pub sort_by: TaskSortBy,
+    /// `true` = Descending (higher progress / newer request / larger size first).
+    pub sort_desc: bool,
+    /// Keep actively downloading tasks pinned at the top regardless of sort column.
+    pub pin_downloading: bool,
+}
+
+impl Default for TaskListFilterState {
+    fn default() -> Self {
+        Self {
+            quick_filter: TaskQuickFilter::All,
+            protocol_filter: TaskProtocolFilter::All,
+            sort_by: TaskSortBy::ProgressAndTime,
+            sort_desc: true,
+            pin_downloading: true,
+        }
+    }
+}
+
+fn task_pin_rank(status: TaskStatus) -> u8 {
+    match status {
+        TaskStatus::Downloading | TaskStatus::Probing | TaskStatus::Verifying => 0,
+        TaskStatus::Queued => 1,
+        TaskStatus::Paused | TaskStatus::LinkExpired | TaskStatus::Error => 2,
+        TaskStatus::Seeding => 3,
+        TaskStatus::Completed => 4,
+    }
+}
+
+fn quantized_progress_pct(task: &DownloadTask) -> u32 {
+    if task.status.is_finished() {
+        100
+    } else {
+        (task.progress_ratio().clamp(0.0, 1.0) * 100.0).floor() as u32
+    }
+}
+
+pub fn sort_tasks(tasks: &mut [&DownloadTask], filter: TaskListFilterState) {
+    tasks.sort_by(|a, b| {
+        if filter.pin_downloading {
+            let tier_cmp = match filter.sort_by {
+                // Default mode keeps full intuitive tier ordering: Downloading -> Queued -> Paused -> Seeding -> Completed
+                TaskSortBy::ProgressAndTime => {
+                    task_pin_rank(a.status).cmp(&task_pin_rank(b.status))
+                }
+                // Explicit column sorts pin active downloads to top while sorting everything else purely by chosen column
+                _ => {
+                    let a_active = if a.status.is_active() { 0u8 } else { 1u8 };
+                    let b_active = if b.status.is_active() { 0u8 } else { 1u8 };
+                    a_active.cmp(&b_active)
+                }
+            };
+            if tier_cmp != std::cmp::Ordering::Equal {
+                return tier_cmp;
+            }
+        }
+
+        let primary = match filter.sort_by {
+            TaskSortBy::ProgressAndTime => quantized_progress_pct(a)
+                .cmp(&quantized_progress_pct(b))
+                .then_with(|| a.created_at.cmp(&b.created_at)),
+            TaskSortBy::Progress => quantized_progress_pct(a)
+                .cmp(&quantized_progress_pct(b))
+                .then_with(|| a.created_at.cmp(&b.created_at)),
+            TaskSortBy::CreatedAt => a.created_at.cmp(&b.created_at),
+            TaskSortBy::Size => {
+                let sa = a.total_size.unwrap_or(a.downloaded_bytes);
+                let sb = b.total_size.unwrap_or(b.downloaded_bytes);
+                sa.cmp(&sb).then_with(|| a.created_at.cmp(&b.created_at))
+            }
+            TaskSortBy::Name => a
+                .filename
+                .to_ascii_lowercase()
+                .cmp(&b.filename.to_ascii_lowercase())
+                .then_with(|| a.created_at.cmp(&b.created_at)),
+        };
+
+        let ordered = if filter.sort_desc {
+            match filter.sort_by {
+                // For Name, "default/desc" means A->Z (natural), toggled means Z->A
+                TaskSortBy::Name => primary,
+                _ => primary.reverse(),
+            }
+        } else {
+            match filter.sort_by {
+                TaskSortBy::Name => primary.reverse(),
+                _ => primary,
+            }
+        };
+
+        ordered.then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TorrentSummary {
+    pub total: usize,
+    pub seeding: usize,
+    pub downloading: usize,
+    pub active_or_queued: usize,
+    pub paused_or_error: usize,
+    pub stopped: usize,
+    pub completed_idle: usize,
+    pub total_upload_bps: u64,
+    pub total_uploaded_bytes: u64,
+    pub bt_enabled: bool,
+    pub seed_after_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +285,12 @@ pub enum InputTarget {
     P2pEd2kInput,
     P2pSearch,
     P2pSaveDir,
+    RssUrl,
+    RssName,
+    RssInclude,
+    RssExclude,
+    RssSaveDir,
+    RssSearch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +524,18 @@ pub struct RuleDraft {
     pub connections: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RssDraft {
+    pub editing_id: Option<Uuid>,
+    pub url: String,
+    pub name: String,
+    pub include_filter: String,
+    pub exclude_filter: String,
+    pub save_dir: String,
+    pub auto_download: bool,
+    pub refresh_interval_mins: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // Window & platform lifecycle
@@ -367,7 +570,6 @@ pub enum Message {
     CaptureCancel,
 
     // Standalone Browser Resource Sniff & Selective Download Window
-    OpenEmptySniffPopup,
     SniffWindowOpened(window::Id),
     SniffWindowRawId(u64),
     SniffDragWindow,
@@ -392,7 +594,6 @@ pub enum Message {
     SniffDownloadSelected(bool),
 
     // Standalone BitTorrent (.torrent / Magnet) & eD2k Selective Download Window
-    OpenP2pSelectPopup(P2pSelectTab, Option<String>),
     P2pWindowOpened(window::Id),
     P2pWindowRawId(u64),
     P2pDragWindow,
@@ -456,6 +657,18 @@ pub enum Message {
 
     // Navigation & quick bar
     SelectNav(NavSection),
+    SetTorrentFilter(TorrentFilter),
+    SetTaskQuickFilter(TaskQuickFilter),
+    SetTaskProtocolFilter(TaskProtocolFilter),
+    SetTaskSortBy(TaskSortBy),
+    ToggleTaskSortOrder,
+    TogglePinDownloading(bool),
+    ResetTaskFilters,
+    ResumeAllTorrents,
+    PauseAllTorrents,
+    StartAllSeeding,
+    StopAllSeeding,
+    BatchSeedingFinished(std::result::Result<String, String>),
     QuickBarChanged(String),
     QuickBarSubmit,
     CycleTheme,
@@ -520,6 +733,9 @@ pub enum Message {
     SchedulerTick,
 
     // BitTorrent & Custom Tracker dedicated workspace
+    BtToggleEnabled(bool),
+    BtToggleSeedAfterComplete(bool),
+    BtSetMaxSeedRatio(f64),
     BtToggleDht(bool),
     BtToggleLsd(bool),
     BtToggleUpnp(bool),
@@ -592,6 +808,34 @@ pub enum Message {
     RuleDelete(Uuid),
     RulesLoaded(Vec<AutomationRule>),
 
+    // RSS subscriptions & auto-download workspace
+    RssToggleGlobalEnabled(bool),
+    RssSetDefaultInterval(u32),
+    RssDraftUrl(String),
+    RssDraftName(String),
+    RssDraftInclude(String),
+    RssDraftExclude(String),
+    RssDraftSaveDir(String),
+    RssDraftBrowseDir,
+    RssDraftDirPicked(Option<PathBuf>),
+    RssDraftToggleAutoDownload(bool),
+    RssDraftSetInterval(u32),
+    RssDraftSubmit,
+    RssEditStart(Uuid),
+    RssEditCancel,
+    RssSelectFeed(Option<Uuid>),
+    RssToggleFeedEnabled(Uuid, bool),
+    RssToggleFeedAutoDownload(Uuid, bool),
+    RssDeleteFeed(Uuid),
+    RssRefreshFeed(Uuid),
+    RssRefreshAll,
+    RssRefreshFinished(Uuid, std::result::Result<FetchedRssFeed, String>),
+    RssSearchChanged(String),
+    RssToggleMatchOnly(bool),
+    RssDownloadItem(Uuid, String),
+    RssDownloadAllMatching(Option<Uuid>),
+    RssMarkAllRead(Option<Uuid>),
+
     // Plugins workspace
     ReloadPlugins,
     PluginsLoaded(Vec<ExternalPlugin>),
@@ -652,4 +896,113 @@ pub enum Message {
 
     // Toast notification
     ClearToast,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use std::collections::BTreeMap;
+
+    fn sample_task(
+        name: &str,
+        status: TaskStatus,
+        downloaded: u64,
+        total: u64,
+        age_secs: i64,
+    ) -> DownloadTask {
+        let now = Utc::now();
+        DownloadTask {
+            id: Uuid::new_v4(),
+            original_url: format!("https://example.com/{name}"),
+            resolved_url: format!("https://example.com/{name}"),
+            filename: name.to_string(),
+            save_dir: PathBuf::from("."),
+            protocol: ProtocolKind::Http,
+            category: FileCategory::Other,
+            status,
+            content_type: None,
+            matched_rule: None,
+            total_size: Some(total),
+            downloaded_bytes: downloaded,
+            speed_bps: 0,
+            eta_secs: None,
+            supports_range: true,
+            etag: None,
+            last_modified: None,
+            max_connections: 8,
+            speed_limit_bps: 0,
+            headers: BTreeMap::new(),
+            segments: Vec::new(),
+            checksum: None,
+            selected_files: None,
+            source: TaskSource::Manual,
+            error_message: None,
+            created_at: now - Duration::seconds(age_secs),
+            completed_at: status.is_finished().then_some(now),
+            speed_history: Vec::new(),
+            logs: Vec::new(),
+            bt_telemetry: None,
+        }
+    }
+
+    #[test]
+    fn default_sort_pins_downloading_and_orders_by_progress_then_request_time() {
+        let done_new = sample_task("done_new.zip", TaskStatus::Completed, 100, 100, 10);
+        let done_old = sample_task("done_old.zip", TaskStatus::Completed, 100, 100, 300);
+        let dl_low = sample_task("dl_low.iso", TaskStatus::Downloading, 25, 100, 5);
+        let dl_high_old = sample_task("dl_high_old.iso", TaskStatus::Downloading, 80, 100, 60);
+        let dl_high_new = sample_task("dl_high_new.iso", TaskStatus::Downloading, 80, 100, 20);
+        let paused_mid = sample_task("paused.bin", TaskStatus::Paused, 50, 100, 15);
+        let seeding = sample_task("seed.mkv", TaskStatus::Seeding, 100, 100, 120);
+
+        let all = [
+            &done_old,
+            &seeding,
+            &dl_low,
+            &done_new,
+            &paused_mid,
+            &dl_high_old,
+            &dl_high_new,
+        ];
+        let mut sorted = all.to_vec();
+        sort_tasks(&mut sorted, TaskListFilterState::default());
+
+        let names: Vec<&str> = sorted.iter().map(|t| t.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "dl_high_new.iso",
+                "dl_high_old.iso",
+                "dl_low.iso",
+                "paused.bin",
+                "seed.mkv",
+                "done_new.zip",
+                "done_old.zip",
+            ]
+        );
+    }
+
+    #[test]
+    fn unpinned_created_at_sort_respects_ascending_and_descending() {
+        let t_old = sample_task("old.bin", TaskStatus::Downloading, 10, 100, 500);
+        let t_new = sample_task("new.bin", TaskStatus::Completed, 100, 100, 10);
+        let mut sorted = vec![&t_old, &t_new];
+
+        let filter = TaskListFilterState {
+            sort_by: TaskSortBy::CreatedAt,
+            sort_desc: true,
+            pin_downloading: false,
+            ..Default::default()
+        };
+        sort_tasks(&mut sorted, filter);
+        assert_eq!(sorted[0].filename, "new.bin");
+
+        let asc_filter = TaskListFilterState {
+            sort_desc: false,
+            ..filter
+        };
+        sort_tasks(&mut sorted, asc_filter);
+        assert_eq!(sorted[0].filename, "old.bin");
+    }
 }

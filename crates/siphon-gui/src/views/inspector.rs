@@ -1,6 +1,6 @@
 use crate::i18n::Strings;
 use crate::icons::{IconKind, icon};
-use crate::state::{InputTarget, Message, NavSection, P2pSelectTab};
+use crate::state::{InputTarget, Message, NavSection};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_MONO_BOLD, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette,
     clean_scrollable_style, danger_btn_style, hairline_rule_style, input_style, outline_btn_style,
@@ -413,7 +413,7 @@ pub fn view<'a>(
         .width(Length::Fill)
         .style(primary_btn_style(palette))
         .on_press(Message::PauseTask(task.id))
-    } else if task.status == TaskStatus::Completed {
+    } else if task.status.is_finished() {
         button(
             container(
                 row![
@@ -750,7 +750,8 @@ fn view_bt_inspector<'a>(
 
     // Distinct Protocol Identity Card (accent-tinted badge + InfoHash copy bar)
     let status_color = palette.status_color(task.status);
-    let phase_label = if task.status.is_active() {
+    let is_seeding = task.status == TaskStatus::Seeding;
+    let phase_label = if task.status.is_active() || is_seeding {
         tel.map(|t| t.phase.as_str())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| strings.status_label(task.status))
@@ -811,6 +812,7 @@ fn view_bt_inspector<'a>(
                             text(if is_magnet { "MAGNET 磁力" } else { "TORRENT 种子" })
                                 .size(10)
                                 .font(FONT_MONO_BOLD)
+                                .wrapping(text::Wrapping::None)
                                 .color(palette.accent),
                         )
                         .padding([2, 6])
@@ -823,7 +825,11 @@ fn view_bt_inspector<'a>(
                             .size(12)
                             .font(FONT_MEDIUM)
                             .wrapping(text::Wrapping::None)
-                            .color(palette.text_secondary),
+                            .color(if is_seeding {
+                                palette.ok
+                            } else {
+                                palette.text_secondary
+                            }),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -854,13 +860,15 @@ fn view_bt_inspector<'a>(
         _ => BtPortLight::Unknown,
     };
 
-    let (light_color, light_bg, light_label) = if bt_checking_port {
+    let (light_color, light_bg, light_label) = if !bt_status.enabled {
+        (palette.text_muted, palette.bg_input, "BT 已关闭")
+    } else if bt_checking_port {
         (palette.accent, palette.accent_soft, "端口探测中...")
     } else {
         match effective_light {
-            BtPortLight::Green => (palette.ok, palette.ok_soft, "绿灯 · 入站畅通"),
-            BtPortLight::Yellow => (palette.warn, palette.warn_soft, "黄灯 · 仅出站受限"),
-            BtPortLight::Red => (palette.err, palette.err_soft, "红灯 · 监听异常"),
+            BtPortLight::Green => (palette.ok, palette.ok_soft, "入站畅通"),
+            BtPortLight::Yellow => (palette.warn, palette.warn_soft, "仅出站受限"),
+            BtPortLight::Red => (palette.err, palette.err_soft, "监听异常"),
             BtPortLight::Unknown => (palette.text_secondary, palette.bg_input, "端口未检测"),
         }
     };
@@ -915,7 +923,7 @@ fn view_bt_inspector<'a>(
     )
     .padding([4, 9])
     .style(outline_btn_style(palette));
-    if !bt_checking_port {
+    if bt_status.enabled && !bt_checking_port {
         check_port_btn = check_port_btn.on_press(Message::BtCheckPort);
     }
 
@@ -1075,7 +1083,14 @@ fn view_bt_inspector<'a>(
     .spacing(9);
 
     // Smart live diagnostic banner tailored to current Swarm + port status
-    let diag_banner: Option<(Color, Color, String, String)> = if effective_light == BtPortLight::Red {
+    let diag_banner: Option<(Color, Color, String, String)> = if !bt_status.enabled {
+        Some((
+            palette.text_secondary,
+            palette.bg_input,
+            "BitTorrent 引擎当前已关闭".to_string(),
+            "请点击下方「BT 端口与 Tracker 设置」启用 BT 引擎开关后再继续下载或做种。".to_string(),
+        ))
+    } else if effective_light == BtPortLight::Red {
         if let Some(rep) = bt_port_report {
             Some((
                 palette.err,
@@ -1104,7 +1119,7 @@ fn view_bt_inspector<'a>(
             }
         } else {
             match effective_light {
-                BtPortLight::Yellow => "当前为黄灯（仅出站）：已启用 MSE/PE 加密握手；若连上率仍低，建议开启路由器 UPnP / 端口转发并确认公网 IPv6 可用。".to_string(),
+                BtPortLight::Yellow => "当前仅支持出站连接：已启用 MSE/PE 加密握手；若连上率仍低，建议开启路由器 UPnP / 端口转发并确认公网 IPv6 可用。".to_string(),
                 BtPortLight::Green => "入站端口已畅通，正在与对端进行加密握手（冷门种子可能需要多等待片刻）。".to_string(),
                 _ => "建议点击上方「测端口」检测本机监听、IPv6 与外网端口可达性，排查是否受 NAT 或防火墙阻塞。".to_string(),
             }
@@ -1174,6 +1189,72 @@ fn view_bt_inspector<'a>(
         0.0
     };
 
+    let (seed_dot_color, seed_status_text, seed_status_fg, seed_status_bg) = if is_seeding {
+        (
+            palette.ok,
+            format!("正在做种 · ↑ {} · 分享率 {:.2}", format_speed(upload_bps), share_ratio),
+            palette.ok,
+            palette.ok_soft,
+        )
+    } else if task.status == TaskStatus::Completed {
+        (
+            palette.text_muted,
+            "已完成 · 已停止做种".to_string(),
+            palette.text_secondary,
+            palette.bg_input,
+        )
+    } else if task.status.is_active() && upload_bps > 0 {
+        (
+            palette.ok,
+            format!("边下边上传 · ↑ {}", format_speed(upload_bps)),
+            palette.ok,
+            palette.ok_soft,
+        )
+    } else if task.status.is_active() {
+        (
+            palette.accent,
+            if bt_status.seed_after_complete {
+                "下载中 · 完成后自动做种".to_string()
+            } else {
+                "下载中 · 完成后停止".to_string()
+            },
+            palette.text_secondary,
+            palette.bg_input,
+        )
+    } else {
+        (
+            palette.text_muted,
+            "未在做种".to_string(),
+            palette.text_muted,
+            palette.bg_input,
+        )
+    };
+
+    let seeding_strip = container(
+        row![
+            text("做种状态")
+                .size(11)
+                .font(FONT_REGULAR)
+                .wrapping(text::Wrapping::None)
+                .color(palette.text_muted),
+            space::horizontal(),
+            container(space())
+                .width(Length::Fixed(6.0))
+                .height(Length::Fixed(6.0))
+                .style(panel_style(seed_dot_color, None, 3.0)),
+            text(seed_status_text)
+                .size(11)
+                .font(FONT_MONO)
+                .wrapping(text::Wrapping::None)
+                .color(seed_status_fg),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([6, 9])
+    .width(Length::Fill)
+    .style(panel_style(seed_status_bg, Some(palette.hairline), 7.0));
+
     let speed_card = container(
         column![
             row![
@@ -1193,7 +1274,7 @@ fn view_bt_inspector<'a>(
                 text(format!("↑ {}", format_speed(upload_bps)))
                     .size(12)
                     .font(FONT_MONO)
-                    .color(if upload_bps > 0 {
+                    .color(if upload_bps > 0 || is_seeding {
                         palette.ok
                     } else {
                         palette.text_muted
@@ -1201,6 +1282,7 @@ fn view_bt_inspector<'a>(
             ]
             .spacing(8)
             .align_y(Alignment::Center),
+            seeding_strip,
             canvas(SpeedChart {
                 samples: task.speed_history.clone(),
                 palette,
@@ -1224,7 +1306,15 @@ fn view_bt_inspector<'a>(
                     format!("{} ({:.2})", format_bytes(uploaded_bytes), share_ratio),
                     palette
                 ),
-                stat_cell("预计剩余", format_eta(task.eta_secs), palette),
+                stat_cell(
+                    "预计剩余",
+                    if task.status.is_finished() {
+                        "已完成".to_string()
+                    } else {
+                        format_eta(task.eta_secs)
+                    },
+                    palette
+                ),
             ]
             .spacing(8),
         ]
@@ -1242,7 +1332,7 @@ fn view_bt_inspector<'a>(
         _ => format!("{:.1}%", task.progress_ratio() * 100.0),
     };
     let subfile_summary = match &task.selected_files {
-        Some(idxs) if !idxs.is_empty() => format!("仅下载勾选的 {} 个子文件", idxs.len()),
+        Some(idxs) if !idxs.is_empty() => format!("已勾选 {} 个子文件", idxs.len()),
         _ => "下载种子全部文件".to_string(),
     };
 
@@ -1267,29 +1357,10 @@ fn view_bt_inspector<'a>(
             })
             .width(Length::Fill)
             .height(Length::Fixed(14.0)),
-            row![
-                text(subfile_summary)
-                    .size(12)
-                    .font(FONT_REGULAR)
-                    .color(palette.text_secondary)
-                    .width(Length::Fill),
-                button(
-                    row![
-                        icon(IconKind::Layers, 12.0, palette.accent),
-                        text("查看/重选文件").size(11).font(FONT_MEDIUM),
-                    ]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
-                )
-                .padding([4, 9])
-                .style(outline_btn_style(palette))
-                .on_press(Message::OpenP2pSelectPopup(
-                    P2pSelectTab::Torrent,
-                    Some(task.original_url.clone()),
-                )),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+            text(subfile_summary)
+                .size(12)
+                .font(FONT_REGULAR)
+                .color(palette.text_secondary),
         ]
         .spacing(10),
     )
@@ -1317,10 +1388,12 @@ fn view_bt_inspector<'a>(
 
     if top_peers.is_empty() {
         peers_col = peers_col.push(
-            text(if task.status.is_active() {
+            text(if is_seeding {
+                "正在做种待机，等待其他 Peer 连入请求分片，连上后将在此实时显示..."
+            } else if task.status.is_active() {
                 "正在与 Peer 建立连接并拉取数据，连上后将在此实时列出活跃节点..."
             } else {
-                "任务当前未传输，恢复下载后可实时查看已连入节点列表"
+                "任务当前未传输，恢复下载或继续做种后可实时查看已连入节点列表"
             })
             .size(11)
             .font(FONT_REGULAR)
@@ -1408,13 +1481,16 @@ fn view_bt_inspector<'a>(
         );
     }
 
-    // BT Actions (NO HTTP "replace direct link" — replaced with direct jump to BT Port & Tracker Settings)
+    // BT Actions (NO HTTP "replace direct link" — replaced with direct jump to BT Port & Tracker Settings + Seeding controls)
     let primary_op = if task.status.is_active() || task.status == TaskStatus::Queued {
         button(
             container(
                 row![
                     icon(IconKind::Pause, 13.0, palette.cta_text),
-                    text("暂停").size(13).font(FONT_MEDIUM),
+                    text("暂停")
+                        .size(13)
+                        .font(FONT_MEDIUM)
+                        .wrapping(text::Wrapping::None),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -1429,12 +1505,15 @@ fn view_bt_inspector<'a>(
         .width(Length::Fill)
         .style(primary_btn_style(palette))
         .on_press(Message::PauseTask(task.id))
-    } else if task.status == TaskStatus::Completed {
+    } else if task.status.is_finished() {
         button(
             container(
                 row![
                     icon(IconKind::Play, 13.0, palette.cta_text),
-                    text(strings.open_file()).size(13).font(FONT_MEDIUM),
+                    text(strings.open_file())
+                        .size(13)
+                        .font(FONT_MEDIUM)
+                        .wrapping(text::Wrapping::None),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -1454,7 +1533,10 @@ fn view_bt_inspector<'a>(
             container(
                 row![
                     icon(IconKind::Play, 13.0, palette.cta_text),
-                    text("继续下载").size(13).font(FONT_MEDIUM),
+                    text("继续下载")
+                        .size(13)
+                        .font(FONT_MEDIUM)
+                        .wrapping(text::Wrapping::None),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -1471,27 +1553,80 @@ fn view_bt_inspector<'a>(
         .on_press(Message::ResumeTask(task.id))
     };
 
-    let actions_grid = column![
-        row![
-            primary_op,
+    let mut top_action_row = row![primary_op].spacing(8);
+    if is_seeding {
+        top_action_row = top_action_row.push(
             button(
                 container(
                     row![
-                        icon(IconKind::Folder, 14.0, palette.text_secondary),
-                        text(strings.open_folder()).size(13).font(FONT_REGULAR),
+                        icon(IconKind::Pause, 13.0, palette.warn),
+                        text("停止做种")
+                            .size(12)
+                            .font(FONT_MEDIUM)
+                            .wrapping(text::Wrapping::None),
                     ]
-                    .spacing(6)
+                    .spacing(5)
                     .align_y(Alignment::Center),
                 )
                 .height(Length::Fill)
                 .align_y(Alignment::Center),
             )
             .height(Length::Fixed(34.0))
-            .padding([0, 12])
+            .padding([0, 10])
             .style(outline_btn_style(palette))
-            .on_press(Message::RevealTaskInExplorer(task.id)),
-        ]
-        .spacing(8),
+            .on_press(Message::PauseTask(task.id)),
+        );
+    } else if task.status == TaskStatus::Completed && bt_status.enabled {
+        top_action_row = top_action_row.push(
+            button(
+                container(
+                    row![
+                        icon(IconKind::Play, 12.0, palette.ok),
+                        text("继续做种")
+                            .size(12)
+                            .font(FONT_MEDIUM)
+                            .wrapping(text::Wrapping::None),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                )
+                .height(Length::Fill)
+                .align_y(Alignment::Center),
+            )
+            .height(Length::Fixed(34.0))
+            .padding([0, 10])
+            .style(outline_btn_style(palette))
+            .on_press(Message::ResumeTask(task.id)),
+        );
+    }
+    top_action_row = top_action_row.push(
+        button(
+            container(
+                row![
+                    icon(IconKind::Folder, 14.0, palette.text_secondary),
+                    text(if task.status.is_finished() {
+                        "定位"
+                    } else {
+                        strings.open_folder()
+                    })
+                    .size(13)
+                    .font(FONT_REGULAR)
+                    .wrapping(text::Wrapping::None),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+            .height(Length::Fill)
+            .align_y(Alignment::Center),
+        )
+        .height(Length::Fixed(34.0))
+        .padding([0, 10])
+        .style(outline_btn_style(palette))
+        .on_press(Message::RevealTaskInExplorer(task.id)),
+    );
+
+    let actions_grid = column![
+        top_action_row,
         row![
             button(
                 container(

@@ -7,7 +7,7 @@ use crate::theme::{
 };
 use iced::widget::{button, column, container, row, rule, scrollable, space, text};
 use iced::{Alignment, Color, Element, Length};
-use siphon_core::{DownloadTask, FileCategory, TaskStatus, format_speed};
+use siphon_core::{DownloadTask, FileCategory, ProtocolKind, TaskStatus, format_speed};
 use siphon_engine_bt::{BtPortCheckReport, BtPortLight, BtSessionStatusSnapshot};
 
 #[allow(clippy::too_many_arguments)]
@@ -16,6 +16,7 @@ pub fn view<'a>(
     tasks: &'a [DownloadTask],
     global_speed_bps: u64,
     active_count: usize,
+    rss_feed_count: usize,
     bt_status: &'a BtSessionStatusSnapshot,
     bt_port_report: Option<&'a BtPortCheckReport>,
     bt_checking_port: bool,
@@ -24,10 +25,7 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let total_count = tasks.len();
     let downloading_count = tasks.iter().filter(|t| t.status.is_active()).count();
-    let completed_count = tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::Completed)
-        .count();
+    let completed_count = tasks.iter().filter(|t| t.status.is_finished()).count();
     let paused_count = tasks
         .iter()
         .filter(|t| {
@@ -133,6 +131,108 @@ pub fn view<'a>(
         })
     };
 
+    let bt_total_count = tasks
+        .iter()
+        .filter(|t| t.protocol == ProtocolKind::BitTorrent)
+        .count();
+    let bt_seeding_count = tasks
+        .iter()
+        .filter(|t| t.protocol == ProtocolKind::BitTorrent && t.status == TaskStatus::Seeding)
+        .count();
+
+    let torrents_selected = active_nav == NavSection::Torrents;
+    let torrents_indicator = container(space())
+        .width(Length::Fixed(3.0))
+        .height(Length::Fixed(16.0))
+        .style(panel_style(
+            if torrents_selected {
+                palette.accent
+            } else {
+                Color::TRANSPARENT
+            },
+            None,
+            2.0,
+        ));
+    let torrents_icon_box = container(icon(
+        IconKind::Magnet,
+        15.0,
+        if torrents_selected {
+            palette.text_primary
+        } else if bt_seeding_count > 0 {
+            palette.ok
+        } else {
+            palette.text_muted
+        },
+    ))
+    .width(Length::Fixed(18.0))
+    .center_x(Length::Fixed(18.0))
+    .center_y(Length::Fill);
+
+    let mut torrents_row = row![
+        torrents_indicator,
+        space::horizontal().width(6),
+        torrents_icon_box,
+        space::horizontal().width(10),
+        text(strings.torrents_category())
+            .size(14)
+            .font(if torrents_selected {
+                FONT_MEDIUM
+            } else {
+                FONT_REGULAR
+            })
+            .wrapping(text::Wrapping::None)
+            .color(if torrents_selected {
+                palette.text_primary
+            } else {
+                palette.text_secondary
+            }),
+        space::horizontal(),
+    ]
+    .align_y(Alignment::Center)
+    .height(Length::Fill);
+
+    if bt_seeding_count > 0 {
+        torrents_row = torrents_row.push(
+            row![
+                container(space())
+                    .width(Length::Fixed(6.0))
+                    .height(Length::Fixed(6.0))
+                    .style(panel_style(palette.ok, None, 3.0)),
+                text(format!("{bt_seeding_count}/{bt_total_count}"))
+                    .size(11)
+                    .font(FONT_MONO)
+                    .wrapping(text::Wrapping::None)
+                    .color(palette.ok),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        );
+    } else if bt_total_count > 0 {
+        torrents_row = torrents_row.push(
+            text(bt_total_count.to_string())
+                .size(12)
+                .font(FONT_MONO)
+                .wrapping(text::Wrapping::None)
+                .color(if torrents_selected {
+                    palette.text_secondary
+                } else {
+                    palette.text_muted
+                }),
+        );
+    }
+
+    let torrents_nav_item = button(torrents_row)
+        .width(Length::Fill)
+        .height(Length::Fixed(32.0))
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 10.0,
+            bottom: 0.0,
+            left: 4.0,
+        })
+        .style(nav_btn_style(palette, torrents_selected))
+        .on_press(Message::SelectNav(NavSection::Torrents));
+
     let categories = [
         FileCategory::Video,
         FileCategory::Archive,
@@ -142,7 +242,7 @@ pub fn view<'a>(
         FileCategory::Other,
     ];
 
-    let mut cat_col = column![section_label(strings.nav_categories())].spacing(2);
+    let mut cat_col = column![section_label(strings.nav_categories()), torrents_nav_item].spacing(2);
     for cat in categories {
         let count = tasks.iter().filter(|t| t.category == cat).count();
         cat_col = cat_col.push(nav_item(
@@ -193,6 +293,16 @@ pub fn view<'a>(
         space::vertical().height(14),
         section_label(strings.nav_workspace()),
         nav_item(
+            NavSection::Rss,
+            strings.rss(),
+            IconKind::Rss,
+            if rss_feed_count > 0 {
+                Some(rss_feed_count)
+            } else {
+                None
+            },
+        ),
+        nav_item(
             NavSection::Scheduler,
             strings.scheduler(),
             IconKind::Clock,
@@ -231,16 +341,18 @@ pub fn view<'a>(
         _ => BtPortLight::Unknown,
     };
 
-    let (bt_dot_color, bt_status_label) = if bt_checking_port {
+    let (bt_dot_color, bt_status_label) = if !bt_status.enabled {
+        (palette.text_muted, "BT 引擎已关闭")
+    } else if bt_checking_port {
         (palette.accent, "BT 端口检测中...")
     } else {
         match bt_light {
-            BtPortLight::Green => (palette.ok, "BT 绿灯 · 入站畅通"),
-            BtPortLight::Yellow => (palette.warn, "BT 黄灯 · 仅出站"),
-            BtPortLight::Red => (palette.err, "BT 红灯 · 监听异常"),
+            BtPortLight::Green => (palette.ok, "BT 入站畅通"),
+            BtPortLight::Yellow => (palette.warn, "BT 仅出站"),
+            BtPortLight::Red => (palette.err, "BT 监听异常"),
             BtPortLight::Unknown => {
                 if bt_status.session_ready {
-                    (palette.accent, "BT 就绪 · 待测端口")
+                    (palette.accent, "BT 待测端口")
                 } else {
                     (palette.text_muted, "BT 引擎预热中")
                 }
@@ -256,23 +368,41 @@ pub fn view<'a>(
     } else {
         "--".to_string()
     };
-    let bt_sub_line = if bt_status.live_peers > 0 {
-        format!(
-            "{} {} · Peer {} · DHT {}",
-            if bt_status.dual_stack { "双栈" } else { "v4" },
-            port_text,
-            bt_status.live_peers,
-            dht_total
+    let (bt_sub_line, bt_sub_color) = if !bt_status.enabled {
+        ("点击前往 BT 页面开启".to_string(), palette.text_muted)
+    } else if bt_status.seeding_torrents > 0 {
+        (
+            format!(
+                "做种 {} · ↑ {} · {}",
+                bt_status.seeding_torrents,
+                format_speed(bt_status.upload_speed_bps),
+                port_text
+            ),
+            palette.ok,
+        )
+    } else if bt_status.live_peers > 0 {
+        (
+            format!(
+                "{} {} · Peer {} · DHT {}",
+                if bt_status.dual_stack { "双栈" } else { "v4" },
+                port_text,
+                bt_status.live_peers,
+                dht_total
+            ),
+            palette.text_muted,
         )
     } else if bt_status.session_ready {
-        format!(
-            "{} {} · DHT {}",
-            if bt_status.dual_stack { "双栈" } else { "v4" },
-            port_text,
-            dht_total
+        (
+            format!(
+                "{} {} · DHT {}",
+                if bt_status.dual_stack { "双栈" } else { "v4" },
+                port_text,
+                dht_total
+            ),
+            palette.text_muted,
         )
     } else {
-        "点击进入 BT 网络诊断".to_string()
+        ("点击进入 BT 网络设置".to_string(), palette.text_muted)
     };
 
     let bt_dot = container(space())
@@ -280,50 +410,58 @@ pub fn view<'a>(
         .height(Length::Fixed(7.0))
         .style(panel_style(bt_dot_color, None, 4.0));
 
-    let mut check_btn = button(
-        text(if bt_checking_port { "检测中" } else { "测端口" })
-            .size(11)
-            .font(FONT_REGULAR)
-            .wrapping(text::Wrapping::None),
-    )
-    .padding([3, 7])
-    .style(outline_btn_style(palette));
-    if !bt_checking_port {
-        check_btn = check_btn.on_press(Message::BtCheckPort);
+    let mut bt_header_row = row![
+        button(
+            row![
+                bt_dot,
+                container(
+                    text(bt_status_label)
+                        .size(12)
+                        .font(FONT_MEDIUM)
+                        .wrapping(text::Wrapping::None)
+                        .color(palette.text_primary),
+                )
+                .width(Length::Fill)
+                .clip(true),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding([1, 2])
+        .width(Length::Fill)
+        .style(subtle_btn_style(palette, false))
+        .on_press(Message::SelectNav(NavSection::BitTorrent)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    if bt_status.enabled {
+        let mut check_btn = button(
+            text(if bt_checking_port { "检测中" } else { "测端口" })
+                .size(11)
+                .font(FONT_REGULAR)
+                .wrapping(text::Wrapping::None),
+        )
+        .padding([3, 7])
+        .style(outline_btn_style(palette));
+        if !bt_checking_port {
+            check_btn = check_btn.on_press(Message::BtCheckPort);
+        }
+        bt_header_row = bt_header_row.push(check_btn);
     }
 
     let bt_card = container(
         column![
-            row![
-                button(
-                    row![
-                        bt_dot,
-                        container(
-                            text(bt_status_label)
-                                .size(12)
-                                .font(FONT_MEDIUM)
-                                .wrapping(text::Wrapping::None)
-                                .color(palette.text_primary),
-                        )
-                        .width(Length::Fill)
-                        .clip(true),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .padding([1, 2])
-                .width(Length::Fill)
-                .style(subtle_btn_style(palette, false))
-                .on_press(Message::SelectNav(NavSection::BitTorrent)),
-                check_btn,
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            text(bt_sub_line)
-                .size(11)
-                .font(FONT_MONO)
-                .wrapping(text::Wrapping::None)
-                .color(palette.text_muted),
+            bt_header_row,
+            container(
+                text(bt_sub_line)
+                    .size(11)
+                    .font(FONT_MONO)
+                    .wrapping(text::Wrapping::None)
+                    .color(bt_sub_color),
+            )
+            .width(Length::Fill)
+            .clip(true),
         ]
         .spacing(5),
     )

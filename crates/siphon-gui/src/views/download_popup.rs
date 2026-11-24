@@ -57,7 +57,7 @@ pub fn view<'a>(
     };
 
     let ratio = task.progress_ratio();
-    let pct_str = if task.total_size.is_some() || task.status == TaskStatus::Completed {
+    let pct_str = if task.total_size.is_some() || task.status.is_finished() {
         format!("{:.1}%", ratio * 100.0)
     } else {
         "—".to_string()
@@ -67,6 +67,7 @@ pub fn view<'a>(
         TaskStatus::Downloading => (format!("正在下载 · {pct_str}"), dl_green, dl_green_soft),
         TaskStatus::Probing => ("正在连接源站...".to_string(), dl_green, dl_green_soft),
         TaskStatus::Verifying => ("正在校验文件...".to_string(), dl_green, dl_green_soft),
+        TaskStatus::Seeding => ("做种中 · 100%".to_string(), palette.ok, palette.ok_soft),
         TaskStatus::Completed => ("下载完成 · 100%".to_string(), palette.ok, palette.ok_soft),
         TaskStatus::Paused => (format!("已暂停 · {pct_str}"), palette.warn, palette.warn_soft),
         TaskStatus::Queued => ("排队等待中".to_string(), palette.text_secondary, palette.bg_input),
@@ -235,6 +236,7 @@ pub fn view<'a>(
         TaskStatus::Downloading => "正在接收数据...",
         TaskStatus::Probing => "正在请求源站信息...",
         TaskStatus::Verifying => "正在校验哈希...",
+        TaskStatus::Seeding => "已完成 · 正在做种",
         TaskStatus::Completed => "传输已完成",
         TaskStatus::Paused => "用户已暂停",
         TaskStatus::Queued => "队列等待中",
@@ -242,16 +244,30 @@ pub fn view<'a>(
         TaskStatus::Error => "连接中断",
     };
 
+    let seeding_up_bps = task
+        .bt_telemetry
+        .as_ref()
+        .map(|t| t.upload_speed_bps)
+        .unwrap_or(0);
+
     let telemetry_grid = row![
         telemetry_cell("传输状态", detail_status_str.to_string(), palette.text_primary, palette),
         telemetry_cell(
-            "实时速率",
-            if task.status.is_active() {
+            if task.status == TaskStatus::Seeding {
+                "做种上传"
+            } else {
+                "实时速率"
+            },
+            if task.status == TaskStatus::Seeding {
+                format!("↑ {}", format_speed(seeding_up_bps))
+            } else if task.status.is_active() {
                 format_speed(task.speed_bps)
             } else {
                 "0 B/s".to_string()
             },
-            if task.speed_bps > 0 {
+            if task.status == TaskStatus::Seeding {
+                palette.ok
+            } else if task.speed_bps > 0 {
                 dl_green
             } else {
                 palette.text_primary
@@ -260,7 +276,7 @@ pub fn view<'a>(
         ),
         telemetry_cell(
             "剩余时间",
-            if task.status == TaskStatus::Completed {
+            if task.status.is_finished() {
                 "00s".to_string()
             } else {
                 format_eta(task.eta_secs)
@@ -345,8 +361,28 @@ pub fn view<'a>(
         .font(FONT_REGULAR)
         .style(checkbox_style(palette, false));
 
-    let action_buttons: Element<'a, Message> = if task.status == TaskStatus::Completed {
-        row![
+    let action_buttons: Element<'a, Message> = if task.status.is_finished() {
+        let left_btn = if task.status == TaskStatus::Seeding {
+            button(
+                container(
+                    row![
+                        icon(IconKind::Pause, 13.0, palette.warn),
+                        text("停止做种")
+                            .size(13)
+                            .font(FONT_REGULAR)
+                            .wrapping(text::Wrapping::None),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .height(Length::Fill)
+                .align_y(Alignment::Center),
+            )
+            .height(Length::Fixed(34.0))
+            .padding([0, 14])
+            .style(outline_btn_style(palette))
+            .on_press(Message::PauseTask(task.id))
+        } else {
             button(
                 container(
                     text("关闭窗口")
@@ -360,7 +396,10 @@ pub fn view<'a>(
             .height(Length::Fixed(34.0))
             .padding([0, 14])
             .style(outline_btn_style(palette))
-            .on_press(Message::DownloadPopupClose(win_id)),
+            .on_press(Message::DownloadPopupClose(win_id))
+        };
+        row![
+            left_btn,
             button(
                 container(
                     row![

@@ -1,5 +1,5 @@
 use crate::icons::{IconKind, icon};
-use crate::state::{InputTarget, Message, P2pSelectTab, ServerTestStatus};
+use crate::state::{InputTarget, Message, ServerTestStatus};
 use crate::theme::{
     FONT_MEDIUM, FONT_MONO, FONT_REGULAR, FONT_SEMIBOLD, SiphonPalette, clean_scrollable_style,
     danger_btn_style, hairline_rule_style, input_style, outline_btn_style, panel_style,
@@ -53,17 +53,6 @@ pub fn view<'a>(
         ]
         .spacing(4),
         space::horizontal(),
-        button(
-            row![
-                icon(IconKind::Server, 13.0, palette.accent),
-                text("eD2k 选择下载窗").size(13).font(FONT_MEDIUM),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        )
-        .padding([8, 14])
-        .style(outline_btn_style(palette))
-        .on_press(Message::OpenP2pSelectPopup(P2pSelectTab::Ed2k, None)),
         button(text("保存 eD2k 设置").size(13).font(FONT_MEDIUM))
             .padding([8, 16])
             .style(primary_btn_style(palette))

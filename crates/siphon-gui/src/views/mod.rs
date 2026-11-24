@@ -9,6 +9,7 @@ pub mod inspector;
 pub mod new_task;
 pub mod p2p_select_popup;
 pub mod plugins_view;
+pub mod rss_view;
 pub mod rules_view;
 pub mod scheduler_view;
 pub mod settings;

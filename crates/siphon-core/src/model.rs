@@ -44,6 +44,7 @@ pub enum TaskStatus {
     Queued,
     Probing,
     Downloading,
+    Seeding,
     Paused,
     Verifying,
     Completed,
@@ -56,11 +57,16 @@ impl TaskStatus {
         matches!(self, Self::Probing | Self::Downloading | Self::Verifying)
     }
 
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Completed | Self::Seeding)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Probing => "probing",
             Self::Downloading => "downloading",
+            Self::Seeding => "seeding",
             Self::Paused => "paused",
             Self::Verifying => "verifying",
             Self::Completed => "completed",
@@ -74,6 +80,7 @@ impl TaskStatus {
             "queued" => Self::Queued,
             "probing" => Self::Probing,
             "downloading" => Self::Downloading,
+            "seeding" => Self::Seeding,
             "paused" => Self::Paused,
             "verifying" => Self::Verifying,
             "completed" => Self::Completed,
@@ -297,6 +304,7 @@ pub enum TaskSource {
     DragDrop,
     Browser,
     Plugin,
+    Rss,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +330,7 @@ pub struct BtPeerBrief {
 pub struct BtLiveTelemetry {
     pub info_hash: String,
     pub phase: String,
+    pub is_seeding: bool,
     pub listen_addr: String,
     pub listen_port: u16,
     pub dual_stack: bool,
@@ -411,7 +420,7 @@ impl DownloadTask {
     pub fn progress_ratio(&self) -> f32 {
         match self.total_size {
             Some(0) => {
-                if self.status == TaskStatus::Completed {
+                if self.status.is_finished() {
                     1.0
                 } else {
                     0.0
@@ -419,7 +428,7 @@ impl DownloadTask {
             }
             Some(total) => (self.downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0) as f32,
             None => {
-                if self.status == TaskStatus::Completed {
+                if self.status.is_finished() {
                     1.0
                 } else {
                     0.0

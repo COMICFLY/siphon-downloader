@@ -43,19 +43,45 @@ pub fn open_folder(dir: &Path) {
     }
 }
 
-pub fn open_file(path: &Path) {
+pub fn open_file(path: &Path) -> bool {
     #[cfg(windows)]
     {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::{PCWSTR, w};
+
         let norm = normalize_win_path(path);
-        if norm.exists() {
-            let _ = Command::new("cmd")
-                .args(["/C", "start", "", &norm.to_string_lossy()])
-                .spawn();
+        if !norm.exists() {
+            return false;
         }
+        let wide_path: Vec<u16> = norm
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let wide_dir: Vec<u16> = norm
+            .parent()
+            .unwrap_or(&norm)
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let res = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(wide_path.as_ptr()),
+                None,
+                PCWSTR(wide_dir.as_ptr()),
+                SW_SHOWNORMAL,
+            )
+        };
+        (res.0 as isize) > 32
     }
     #[cfg(not(windows))]
     {
         let _ = path;
+        false
     }
 }
 

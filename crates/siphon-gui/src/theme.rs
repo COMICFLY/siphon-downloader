@@ -189,7 +189,7 @@ impl SiphonPalette {
     pub fn status_color(&self, status: TaskStatus) -> Color {
         match status {
             TaskStatus::Downloading | TaskStatus::Probing | TaskStatus::Verifying => self.accent,
-            TaskStatus::Completed => self.ok,
+            TaskStatus::Completed | TaskStatus::Seeding => self.ok,
             TaskStatus::Queued | TaskStatus::Paused => self.text_secondary,
             TaskStatus::LinkExpired => self.warn,
             TaskStatus::Error => self.err,
@@ -199,7 +199,7 @@ impl SiphonPalette {
     pub fn status_soft_bg(&self, status: TaskStatus) -> Color {
         match status {
             TaskStatus::Downloading | TaskStatus::Probing | TaskStatus::Verifying => self.accent_soft,
-            TaskStatus::Completed => self.ok_soft,
+            TaskStatus::Completed | TaskStatus::Seeding => self.ok_soft,
             TaskStatus::Queued | TaskStatus::Paused => self.bg_raised,
             TaskStatus::LinkExpired => self.warn_soft,
             TaskStatus::Error => self.err_soft,
